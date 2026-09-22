@@ -157,3 +157,50 @@ fn cli_prints_summary_when_the_decision_provider_errors() {
             .starts_with("[INFO] 总耗时：")
     );
 }
+
+#[tokio::test]
+async fn host_selection_loads_only_selected_adapter_skills() {
+    let mut registry = adapter_sdk::Registry::default();
+    registry
+        .register("selected", |_| Ok(DemoAdapter::default()))
+        .unwrap();
+    registry
+        .register("unselected", |_| -> Result<DemoAdapter, AdapterError> {
+            panic!("unselected adapter must not be instantiated")
+        })
+        .unwrap();
+    let mut adapter = registry
+        .create("selected", adapter_sdk::Host::default())
+        .unwrap();
+    let mut agent = ManualAgent::new(Cursor::new("{\"Completed\":\"done\"}\n"), Vec::new());
+    let mut names = vec![];
+    let outcome = run(
+        &Task::new("selected adapter").unwrap(),
+        &mut agent,
+        &mut adapter,
+        1,
+        |event| {
+            if let Event::SkillsResolved { skills, .. } = event {
+                names = skills.into_iter().map(|s| s.name).collect();
+            }
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.status, Status::Completed);
+    assert!(names.iter().any(|n| n == "perform_trial"));
+    assert!(!names.iter().any(|n| n == "explore_step"));
+}
+
+#[test]
+fn unknown_adapter_is_rejected_before_model_setup() {
+    let output = Command::new(env!("CARGO_BIN_EXE_actweave"))
+        .args(["test", "--adapter", "missing"])
+        .env_remove("JEVKEY")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("unknown adapter: missing"));
+    assert!(!error.contains("JEVKEY"));
+}

@@ -14,6 +14,7 @@
 - [Library 入口](src/lib.rs)：公开模块与 Demo 重导出。
 - [独立 Adapter 契约](crates/adapter-api/src/lib.rs)：Adapter、Skill、SkillContext、DecisionContext；`decision_context` 返回 Skills 与本轮 guidance，输入最近结果、分阶段失败及未解决中断；统一异步 execute，不依赖 Core。
 - [Adapter SDK](crates/adapter-sdk/src/lib.rs)：重导出契约与 automation，提供编译时 Registry、每次创建独立适配器实例及宿主日志能力 Host；RegisteredAdapter 实现同一个 Adapter 契约，不引入动态库 ABI。
+- [宿主适配器选择](src/bin/actweave.rs)：CLI 使用 `--adapter <name>`（默认 demo），在模型初始化之前通过 Registry 创建唯一实例并传给 TaskRuntime；仅注入该实例的 Skills。GUI 可通过 Registry::names 展示选项，再通过 Registry::create 创建所选适配器；注册工厂不会实例化其他适配器。
 - [开发 Runtime](crates/adapter-runtime/src/lib.rs)：独立加载已注册适配器、观察状态、获取 Skill、校验可用性、显式调用和输出步骤/参数/结果；执行控制由调用者提供，无 Core、模型或自动决策，不等同于用户任务 Runtime。
 - [Adapter 独立调试入口](crates/demo-adapter/examples/debug.rs)：`cargo run -p demo-adapter --example debug`；只依赖 SDK 与开发 Runtime，使用与主程序相同的 Demo 注册入口运行三次试验。
 - [Core](src/core.rs)：Task、Agent、`Execute { actions, then }`、`Resume`；动作列表校验、决策预算、加载与修复调度；策略不传入 Adapter。
@@ -32,6 +33,8 @@
 - [CLI](src/bin/actweave.rs)：参数与环境变量、模块组装、中文 INFO、任务日志目录、Ctrl+C 取消；`--max-actions` 默认 4，上限 16，设为 1 时不请求序列槽位；无 Web 服务。
 
 ## 测试
+
+- [动态识别区域](crates/automation/src/recognition.rs)：Roi::Fixed 使用客户区像素，Roi::Relative 按每次识别的当前帧尺寸解析，边界向外取整并校验；None 表示全帧。颜色、DirectHit、算法及自定义识别共用此入口，OCR 注册接口继续接收解析后的像素 ROI，无额外模型依赖。
 
 - [自动化闭环](crates/automation/tests/flow.rs)：真实颜色检测配合 mock 输入验证优先分支、结构化目标、自定义扩展、异常恢复、超时预算、取消清理、暂停进度和配置校验。
 

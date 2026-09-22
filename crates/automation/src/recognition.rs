@@ -27,6 +27,73 @@ impl Rect {
     }
 }
 
+/// Recognition area: fixed client pixels or fractions of the current frame.
+/// Relative edges are rounded outward so a nonempty region retains pixel coverage.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Roi {
+    Fixed {
+        rect: Rect,
+    },
+    Relative {
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+    },
+}
+impl Roi {
+    pub fn validate(&self) -> Result<(), Error> {
+        match *self {
+            Self::Fixed { rect } => rect.validate(),
+            Self::Relative {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                if [x, y, width, height].iter().any(|v| !v.is_finite())
+                    || x < 0.0
+                    || y < 0.0
+                    || width <= 0.0
+                    || height <= 0.0
+                    || x + width > 1.0
+                    || y + height > 1.0
+                {
+                    return Err(Error::Invalid(
+                        "relative ROI must be nonempty and inside 0..1".into(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+    pub fn resolve(&self, frame: &Frame) -> Result<Rect, Error> {
+        self.validate()?;
+        let rect = match *self {
+            Self::Fixed { rect } => rect,
+            Self::Relative {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                let left = (x * f64::from(frame.width)).floor() as i32;
+                let top = (y * f64::from(frame.height)).floor() as i32;
+                let right = ((x + width) * f64::from(frame.width)).ceil() as u32;
+                let bottom = ((y + height) * f64::from(frame.height)).ceil() as u32;
+                Rect {
+                    x: left,
+                    y: top,
+                    width: right - left as u32,
+                    height: bottom - top as u32,
+                }
+            }
+        };
+        frame.region(Some(rect))
+    }
+}
+
 /// Packed RGB8 screenshot; construction validates the buffer dimensions.
 pub struct Frame {
     width: u32,
@@ -56,6 +123,12 @@ impl Frame {
     }
     pub fn rgb(&self) -> &[u8] {
         &self.rgb
+    }
+    fn recognition_region(&self, roi: Option<Roi>) -> Result<Rect, Error> {
+        match roi {
+            Some(roi) => roi.resolve(self),
+            None => self.region(None),
+        }
     }
     pub fn region(&self, roi: Option<Rect>) -> Result<Rect, Error> {
         let r = roi.unwrap_or(Rect {
@@ -124,10 +197,10 @@ pub enum Algorithm {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Recognition {
     DirectHit {
-        roi: Option<Rect>,
+        roi: Option<Roi>,
     },
     ColorMatch {
-        roi: Option<Rect>,
+        roi: Option<Roi>,
         lower: [u8; 3],
         upper: [u8; 3],
         min_ratio: f64,
@@ -135,12 +208,12 @@ pub enum Recognition {
     /// Parameters are owned and validated by the registered algorithm backend.
     Algorithm {
         algorithm: Algorithm,
-        roi: Option<Rect>,
+        roi: Option<Roi>,
         parameters: Value,
     },
     Custom {
         name: String,
-        roi: Option<Rect>,
+        roi: Option<Roi>,
         parameters: Value,
     },
     And {
@@ -255,7 +328,7 @@ impl Recognizers {
             recognition.validate()?;
             let result = match recognition {
                 Recognition::DirectHit { roi } => {
-                    RecognitionResult::region(frame.region(*roi)?, 1.0)
+                    RecognitionResult::region(frame.recognition_region(*roi)?, 1.0)
                 }
                 Recognition::ColorMatch {
                     roi,
@@ -263,7 +336,7 @@ impl Recognizers {
                     upper,
                     min_ratio,
                 } => {
-                    let rect = frame.region(*roi)?;
+                    let rect = frame.recognition_region(*roi)?;
                     let mut count = 0u64;
                     for y in rect.y as u32..rect.y as u32 + rect.height {
                         control.check()?;
@@ -296,7 +369,7 @@ impl Recognizers {
                     self.algorithms
                         .get_mut(algorithm)
                         .ok_or_else(|| Error::Unsupported(format!("{algorithm:?}")))?
-                        .recognize(frame, frame.region(*roi)?, parameters, control)
+                        .recognize(frame, frame.recognition_region(*roi)?, parameters, control)
                         .await?
                 }
                 Recognition::Custom {
@@ -307,7 +380,7 @@ impl Recognizers {
                     self.custom
                         .get_mut(name)
                         .ok_or_else(|| Error::Unsupported(name.clone()))?
-                        .recognize(frame, frame.region(*roi)?, parameters, control)
+                        .recognize(frame, frame.recognition_region(*roi)?, parameters, control)
                         .await?
                 }
                 Recognition::And { conditions } | Recognition::Or { conditions } => {

@@ -408,3 +408,117 @@ async fn pause_preserves_position_and_excludes_paused_time() {
     assert_eq!(runner.progress().status, Status::Completed);
     assert_eq!(mock.inputs.len(), 2);
 }
+
+#[tokio::test]
+async fn relative_roi_tracks_frame_size_and_action_target() {
+    let mut recognizers = Recognizers::default();
+    let control = Control::default();
+    let recognition = Recognition::ColorMatch {
+        roi: Some(Roi::Relative {
+            x: 0.5,
+            y: 0.5,
+            width: 0.5,
+            height: 0.5,
+        }),
+        lower: [255, 0, 0],
+        upper: [255, 0, 0],
+        min_ratio: 1.0,
+    };
+    for (width, height) in [(8, 4), (16, 8)] {
+        let mut pixels = vec![0; (width * height * 3) as usize];
+        for y in height / 2..height {
+            for x in width / 2..width {
+                pixels[((y * width + x) * 3) as usize] = 255;
+            }
+        }
+        let frame = Frame::new(width, height, pixels).unwrap();
+        let result = recognizers
+            .recognize(&recognition, &frame, &control)
+            .await
+            .unwrap();
+        assert!(result.matched());
+        let point = Target::Match { index: 0 }.resolve(&result).unwrap();
+        assert_eq!(
+            (point.x, point.y),
+            ((width * 3 / 4) as i32, (height * 3 / 4) as i32)
+        );
+    }
+}
+
+#[tokio::test]
+async fn ocr_extension_receives_resolved_roi_without_needing_real_ocr_backend() {
+    let mut recognizers = Recognizers::default();
+    recognizers
+        .register_algorithm(Algorithm::Ocr, Text)
+        .unwrap();
+    let recognition = Recognition::Algorithm {
+        algorithm: Algorithm::Ocr,
+        roi: Some(Roi::Relative {
+            x: 0.0,
+            y: 0.5,
+            width: 1.0,
+            height: 0.5,
+        }),
+        parameters: json!({"text":"继续"}),
+    };
+    let frame = Frame::new(10, 8, vec![0; 240]).unwrap();
+    let result = recognizers
+        .recognize(&recognition, &frame, &Control::default())
+        .await
+        .unwrap();
+    let detection = &result.matches[0];
+    let bounds = detection.bounds.unwrap();
+    assert_eq!(
+        (bounds.x, bounds.y, bounds.width, bounds.height),
+        (0, 4, 10, 4)
+    );
+    assert_eq!(detection.text.as_deref(), Some("继续"));
+    assert_eq!(detection.score, Some(0.9));
+}
+
+#[test]
+fn roi_rejects_invalid_geometry_and_rounds_outward() {
+    let frame = Frame::new(3, 3, vec![0; 27]).unwrap();
+    let region = Roi::Relative {
+        x: 0.5,
+        y: 0.5,
+        width: 0.5,
+        height: 0.5,
+    }
+    .resolve(&frame)
+    .unwrap();
+    assert_eq!(
+        (region.x, region.y, region.width, region.height),
+        (1, 1, 2, 2)
+    );
+    for roi in [
+        Roi::Relative {
+            x: f64::NAN,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        },
+        Roi::Relative {
+            x: 0.0,
+            y: 0.0,
+            width: 0.0,
+            height: 1.0,
+        },
+        Roi::Relative {
+            x: 0.5,
+            y: 0.0,
+            width: 0.6,
+            height: 1.0,
+        },
+        Roi::Fixed {
+            rect: Rect {
+                x: 2,
+                y: 0,
+                width: 2,
+                height: 1,
+            },
+        },
+    ] {
+        assert!(roi.resolve(&frame).is_err());
+    }
+}

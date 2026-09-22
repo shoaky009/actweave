@@ -69,6 +69,9 @@ enum Injection {
 struct Args {
     /// 自然语言任务，例如：切换到训练模式
     task: String,
+    /// 宿主选择适配器；只加载此实例提供的状态和 Skills
+    #[arg(long, default_value = "demo")]
+    adapter: String,
     /// all 直接注入；on-demand 先展示目录，由决策器按名称或标签加载
     #[arg(long, value_enum, default_value = "all")]
     skill_mode: Injection,
@@ -124,6 +127,9 @@ async fn main() -> ExitCode {
 }
 async fn execute(args: Args) -> Result<bool, Box<dyn std::error::Error>> {
     let task = Task::new(&args.task)?;
+    let mut registry = adapter_sdk::Registry::default();
+    adapter::register(&mut registry, args.scenario.into())?;
+    let mut environment = registry.create(&args.adapter, adapter_sdk::Host::default())?;
     if matches!(args.agent, AgentKind::Manual) && (args.endpoint.is_some() || args.model.is_some())
     {
         return Err("manual 决策器不使用 --endpoint 或 --model".into());
@@ -189,13 +195,13 @@ async fn execute(args: Args) -> Result<bool, Box<dyn std::error::Error>> {
                 .or_else(|| std::env::var("JEV_MODEL").ok())
                 .unwrap_or_else(|| DEFAULT_MODEL.into());
             let mut agent = JevAgent::new(key, endpoint, model)?.with_log_writer(writer);
-            execute_with(runtime, &args, &mut agent, "JEV").await
+            execute_with(runtime, &args, &mut agent, "JEV", &mut environment).await
         }
         AgentKind::Manual => {
             let mut agent =
                 ManualAgent::new(std::io::BufReader::new(std::io::stdin()), std::io::stderr())
                     .with_log_writer(writer);
-            execute_with(runtime, &args, &mut agent, "Manual").await
+            execute_with(runtime, &args, &mut agent, "Manual", &mut environment).await
         }
     }
 }
@@ -206,13 +212,12 @@ async fn execute_with(
     args: &Args,
     agent: &mut impl Agent,
     agent_name: &str,
+    environment: &mut adapter_sdk::RegisteredAdapter,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     println!("[INFO] 决策器：{agent_name}");
+    println!("[INFO] 适配器：{}", args.adapter);
     println!("[INFO] 开始任务：{}", runtime.handle().snapshot().goal);
     println!("[INFO] 最多执行 {} 轮决策", args.max_decisions);
-    let mut registry = adapter_sdk::Registry::default();
-    adapter::register(&mut registry, args.scenario.into())?;
-    let mut environment = registry.create("demo", adapter_sdk::Host::default())?;
     let handle = runtime.handle();
     let summary_handle = handle.clone();
     let signal_task = tokio::spawn(async move {
@@ -223,7 +228,7 @@ async fn execute_with(
     });
     let mut step = 0;
     let outcome = runtime
-        .run(agent, &mut environment, |event| match event {
+        .run(agent, environment, |event| match event {
             Event::Observed(_) => {
                 println!(
                     "[INFO] 已{}当前状态",
