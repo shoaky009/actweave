@@ -1,0 +1,21 @@
+[workspace]
+members = ["crates/adapter-api", "crates/adapter-sdk", "crates/adapter-runtime", "crates/demo-adapter", "crates/automation"]
+resolver = "3"
+
+[package]
+name = "actweave"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+adapter-api = { path = "crates/adapter-api" }
+adapter-sdk = { path = "crates/adapter-sdk" }
+demo-adapter = { path = "crates/demo-adapter" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
