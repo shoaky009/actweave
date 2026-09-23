@@ -6,6 +6,8 @@
 - [工作区配置](Cargo.toml)
 - [Library 入口](src/lib.rs)
 - [CLI](src/bin/actweave.rs)
+- [TUI 应用入口](crates/actweave-tui/src/main.rs)
+- [TUI 页面与任务展示](crates/actweave-tui/src/app.rs)
 
 ## 任务与决策
 

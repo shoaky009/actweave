@@ -1,0 +1,18 @@
+[package]
+name = "actweave-tui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+actweave = { path = "../.." }
+adapter-sdk = { path = "../adapter-sdk" }
+crossterm = "0.28"
+ratatui = "0.29"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+
+[build-dependencies]
+winresource = "0.1"
