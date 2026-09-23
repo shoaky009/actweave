@@ -67,7 +67,10 @@ impl Input {
 
 enum Message {
     Event(TaskEvent),
-    Finished(Box<Result<actweave::core::Outcome, String>>),
+    Finished(
+        Box<Result<actweave::core::Outcome, String>>,
+        RegisteredAdapter,
+    ),
 }
 
 struct App {
@@ -228,7 +231,8 @@ impl App {
                     let key = match std::env::var("JEVKEY") {
                         Ok(key) => key,
                         Err(e) => {
-                            let _ = sender.send(Message::Finished(Box::new(Err(e.to_string()))));
+                            let _ = sender
+                                .send(Message::Finished(Box::new(Err(e.to_string())), instance));
                             return;
                         }
                     };
@@ -244,16 +248,19 @@ impl App {
                                 .await
                         }
                         Err(error) => {
-                            let _ =
-                                sender.send(Message::Finished(Box::new(Err(error.to_string()))));
+                            let _ = sender.send(Message::Finished(
+                                Box::new(Err(error.to_string())),
+                                instance,
+                            ));
                             return;
                         }
                     }
                 }
             };
-            let _ = sender.send(Message::Finished(Box::new(
-                result.map_err(|e| e.to_string()),
-            )));
+            let _ = sender.send(Message::Finished(
+                Box::new(result.map_err(|e| e.to_string())),
+                instance,
+            ));
         });
         Ok(())
     }
@@ -307,7 +314,8 @@ impl App {
                 )),
                 _ => {}
             },
-            Message::Finished(result) => {
+            Message::Finished(result, instance) => {
+                self.instance = Some(instance);
                 self.done = true;
                 match *result {
                     Ok(outcome) => {
@@ -423,7 +431,19 @@ impl App {
                         h.cancel();
                     }
                 }
-                KeyCode::Esc | KeyCode::Char('q') if self.done => return Ok(false),
+                KeyCode::Esc if self.done => {
+                    if let Some(instance) = &self.instance {
+                        let features = instance.features()?;
+                        for feature in &features {
+                            feature.validate()?;
+                        }
+                        self.features = features;
+                    }
+                    self.selected_task = self.selected_task.min(self.features.len());
+                    self.notice.clear();
+                    self.screen = Screen::Tasks;
+                }
+                KeyCode::Char('q') if self.done => return Ok(false),
                 _ => {}
             },
         }
@@ -588,7 +608,7 @@ impl App {
         let help = match self.screen {
             Screen::Adapters | Screen::Tasks => "↑↓ 选择   Enter 确认   Esc 返回/退出",
             Screen::Configure => "Tab 切换   Enter 下一项/开始   Esc 返回",
-            Screen::Running if self.done => "任务已结束   Esc 退出",
+            Screen::Running if self.done => "任务已结束   Esc 返回任务选择   Q 退出",
             Screen::Running => "P 暂停   R 继续   C 取消（在安全边界生效）",
         };
         frame.render_widget(
@@ -671,13 +691,26 @@ mod tests {
                 assert_eq!(app.screen, Screen::Configure);
                 app.inputs[0].value = "2".into();
                 app.start().unwrap();
+                let mut saw_intermediate_state = false;
                 while !app.done {
                     let message = tokio::time::timeout(Duration::from_secs(3), app.messages.recv())
                         .await
                         .unwrap()
                         .unwrap();
                     app.message(message);
+                    if !app.done
+                        && app
+                            .state
+                            .as_ref()
+                            .is_some_and(|s| s.facts["trial"]["completed"] == 1)
+                    {
+                        saw_intermediate_state = true;
+                    }
                 }
+                assert!(
+                    saw_intermediate_state,
+                    "State must update before the batch finishes"
+                );
                 let snapshot = app.handle.as_ref().unwrap().snapshot();
                 assert_eq!(
                     snapshot.status,
@@ -685,6 +718,19 @@ mod tests {
                 );
                 assert_eq!(snapshot.summary.unwrap().model_requests.total, 0);
                 assert!(app.state.is_some());
+                assert!(app.key(KeyCode::Esc).unwrap());
+                assert_eq!(app.screen, Screen::Tasks);
+                app.key(KeyCode::Enter).unwrap();
+                app.inputs[0].value = "1".into();
+                app.start().unwrap();
+                while !app.done {
+                    let message = tokio::time::timeout(Duration::from_secs(3), app.messages.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    app.message(message);
+                }
+                assert_eq!(app.state.as_ref().unwrap().facts["trial"]["completed"], 3);
             })
             .await;
     }

@@ -145,6 +145,7 @@ impl ActiveBatch {
             match environment.observe() {
                 Ok(observed) => {
                     *state = observed;
+                    emit(Event::Observed(state.clone()));
                     if failure
                         .as_ref()
                         .is_some_and(|f| f.stage == FailureStage::Observation)
@@ -314,7 +315,10 @@ impl ActiveBatch {
             }
             // Count a confirmed action even if the following observation fails.
             match environment.observe() {
-                Ok(observed) => *state = observed,
+                Ok(observed) => {
+                    *state = observed;
+                    emit(Event::Observed(state.clone()));
+                }
                 Err(error) => {
                     record_failure(
                         failure,
