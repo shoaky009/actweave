@@ -1,22 +1,24 @@
-//! cargo run -p automation-vision --example recognize -- <image.png> [language]
+//! cargo run -p automation-vision --example recognize -- <image.png> <det.mnn> <rec.mnn> <keys.txt>
 use automation::{Control, recognition::*};
-use automation_vision::Tesseract;
+use automation_vision::Ocr;
 use serde_json::json;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let path = args.next().ok_or("provide an image path")?;
-    let language = args.next().unwrap_or_else(|| "eng".into());
+    let det = args.next().ok_or("provide detection model path")?;
+    let rec = args.next().ok_or("provide recognition model path")?;
+    let dictionary = args.next().ok_or("provide dictionary path")?;
     let image = image::open(path)?.into_rgb8();
     let frame = Frame::new(image.width(), image.height(), image.into_raw())?;
     let mut recognizers = Recognizers::default();
-    recognizers.register_algorithm(Algorithm::Ocr, Tesseract::default())?;
+    recognizers.register_algorithm(Algorithm::Ocr, Ocr::new(det, rec, dictionary).await?)?;
     let result = recognizers
         .recognize(
             &Recognition::Algorithm {
                 algorithm: Algorithm::Ocr,
                 roi: None,
-                parameters: json!({"language":language}),
+                parameters: json!({}),
             },
             &frame,
             &Control::default(),

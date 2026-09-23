@@ -1,5 +1,5 @@
 use automation::{Control, Error, recognition::*};
-use automation_vision::{Templates, Tesseract};
+use automation_vision::{Ocr, Templates};
 use image::{Rgba, RgbaImage};
 use serde_json::json;
 
@@ -77,29 +77,16 @@ async fn missing_template_is_an_error_but_larger_template_is_a_nonmatch() {
     );
 }
 #[tokio::test]
-async fn missing_ocr_executable_is_not_a_nonmatch() {
-    let mut ocr = Tesseract::new("actweave-deliberately-missing-ocr-binary");
-    let frame = Frame::new(1, 1, vec![255; 3]).unwrap();
+async fn missing_ocr_models_are_an_initialization_error() {
     assert!(matches!(
-        ocr.recognize(
-            &frame,
-            Rect {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1
-            },
-            &json!({}),
-            &Control::default()
-        )
-        .await,
+        Ocr::new("missing-det.mnn", "missing-rec.mnn", "missing-keys.txt").await,
         Err(Error::Backend(_))
     ));
 }
 
-/// Explicit integration test; install Tesseract and eng language data first.
+/// Explicit integration test; set ACTWEAVE_OCR_MODELS to a PP-OCRv5 model directory.
 #[tokio::test]
-#[ignore = "requires local Tesseract and eng language data"]
+#[ignore = "requires PP-OCRv5 models and dictionary"]
 async fn real_ocr_reads_generated_text_and_returns_boxes() {
     let patterns = [
         [
@@ -134,8 +121,16 @@ async fn real_ocr_reads_generated_text_and_returns_boxes() {
         }
     }
     let frame = Frame::new(width as u32, height as u32, rgb).unwrap();
-    let mut ocr =
-        Tesseract::new(std::env::var("ACTWEAVE_TESSERACT").unwrap_or_else(|_| "tesseract".into()));
+    let models = std::path::PathBuf::from(
+        std::env::var("ACTWEAVE_OCR_MODELS").expect("set ACTWEAVE_OCR_MODELS"),
+    );
+    let mut ocr = Ocr::new(
+        models.join("PP-OCRv5_mobile_det.mnn"),
+        models.join("PP-OCRv5_mobile_rec.mnn"),
+        models.join("ppocr_keys_v5.txt"),
+    )
+    .await
+    .unwrap();
     let result = ocr
         .recognize(
             &frame,
@@ -145,7 +140,7 @@ async fn real_ocr_reads_generated_text_and_returns_boxes() {
                 width: width as u32,
                 height: height as u32,
             },
-            &json!({"psm":7}),
+            &json!({}),
             &Control::default(),
         )
         .await

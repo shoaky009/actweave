@@ -1,7 +1,7 @@
 //! Optional local recognition backends. Register explicitly with automation::Recognizers.
-//! Template matching needs no native runtime. OCR requires a local Tesseract executable
-//! and language data; no model files are downloaded or cloud calls made implicitly.
+//! Template matching needs no native runtime. OCR uses a resident ocr-rs / MNN engine
+//! and explicit model paths; no models are downloaded or cloud calls made at runtime.
 mod ocr;
 mod template;
-pub use ocr::Tesseract;
+pub use ocr::Ocr;
 pub use template::Templates;

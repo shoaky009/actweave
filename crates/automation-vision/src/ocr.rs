@@ -2,168 +2,188 @@ use automation::{
     Control, Error,
     recognition::{Detection, Frame, RecognitionFuture, RecognitionResult, Recognizer, Rect},
 };
+use image::{DynamicImage, RgbImage};
 use serde::Deserialize;
 use serde_json::Value;
-use std::{path::PathBuf, process::Stdio, time::Duration};
-use tokio::{io::AsyncWriteExt, process::Command};
+use std::{path::PathBuf, sync::Arc, time::Duration};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
-/// Local process backend. Dropping a recognition kills its child process.
-pub struct Tesseract {
-    executable: PathBuf,
-    data_dir: Option<PathBuf>,
+/// One resident CPU engine on a dedicated worker. Models load once per instance.
+/// Cancellation stops waiting; native inference finishes before another request starts.
+pub struct Ocr {
+    sender: mpsc::Sender<Job>,
+    capacity: Arc<Semaphore>,
     timeout: Duration,
 }
-impl Default for Tesseract {
-    fn default() -> Self {
-        Self::new("tesseract")
-    }
+
+struct Job {
+    image: DynamicImage,
+    reply: oneshot::Sender<Result<Vec<Detection>, Error>>,
+    _permit: OwnedSemaphorePermit,
 }
-impl Tesseract {
-    pub fn new(executable: impl Into<PathBuf>) -> Self {
-        Self {
-            executable: executable.into(),
-            data_dir: None,
+
+impl Ocr {
+    /// Model and dictionary files must match. No runtime downloads are performed.
+    pub async fn new(
+        det: impl Into<PathBuf>,
+        rec: impl Into<PathBuf>,
+        dictionary: impl Into<PathBuf>,
+    ) -> Result<Self, Error> {
+        let (det, rec, dictionary) = (det.into(), rec.into(), dictionary.into());
+        Self::start(move || {
+            let engine = ocr_rs::OcrEngine::new(det, rec, dictionary, None)
+                .map_err(|e| Error::Backend(e.to_string()))?;
+            Ok(move |image: DynamicImage| {
+                engine
+                    .recognize(&image)
+                    .map_err(|e| Error::Backend(e.to_string()))?
+                    .into_iter()
+                    .map(|item| {
+                        let rect = item.bbox.rect;
+                        Ok(Detection {
+                            bounds: Some(Rect {
+                                x: rect.left(),
+                                y: rect.top(),
+                                width: rect.width(),
+                                height: rect.height(),
+                            }),
+                            score: Some(f64::from(item.confidence)),
+                            text: Some(item.text),
+                            label: None,
+                            detail: Value::Null,
+                        })
+                    })
+                    .collect()
+            })
+        })
+        .await
+    }
+
+    async fn start<F, R>(initialize: F) -> Result<Self, Error>
+    where
+        F: FnOnce() -> Result<R, Error> + Send + 'static,
+        R: FnMut(DynamicImage) -> Result<Vec<Detection>, Error> + 'static,
+    {
+        let (sender, mut receiver) = mpsc::channel::<Job>(1);
+        let (ready, initialized) = oneshot::channel();
+        std::thread::Builder::new()
+            .name("actweave-ocr".into())
+            .spawn(move || {
+                let mut recognize = match initialize() {
+                    Ok(engine) => engine,
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                        return;
+                    }
+                };
+                if ready.send(Ok(())).is_err() {
+                    return;
+                }
+                while let Some(job) = receiver.blocking_recv() {
+                    if !job.reply.is_closed() {
+                        let result = recognize(job.image);
+                        let _ = job.reply.send(result);
+                    }
+                }
+            })
+            .map_err(|e| Error::Backend(e.to_string()))?;
+        initialized
+            .await
+            .map_err(|_| Error::Backend("OCR worker stopped during initialization".into()))??;
+        Ok(Self {
+            sender,
+            capacity: Arc::new(Semaphore::new(1)),
             timeout: Duration::from_secs(15),
-        }
+        })
     }
-    pub fn with_data_dir(mut self, path: impl Into<PathBuf>) -> Self {
-        self.data_dir = Some(path.into());
-        self
-    }
+
+    /// Includes time waiting for a previous cancelled inference to finish.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
+
     async fn run(
         &self,
         frame: &Frame,
         roi: Rect,
-        parameters: &Parameters,
+        p: &Parameters,
     ) -> Result<RecognitionResult, Error> {
-        frame.region(Some(roi))?;
-        let mut image = format!("P6\n{} {}\n255\n", roi.width, roi.height).into_bytes();
+        let permit = self
+            .capacity
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Backend("OCR worker unavailable".into()))?;
+        let mut rgb = Vec::with_capacity(roi.width as usize * roi.height as usize * 3);
         for y in roi.y as u32..roi.y as u32 + roi.height {
             let start = (y as usize * frame.width() as usize + roi.x as usize) * 3;
-            image.extend_from_slice(&frame.rgb()[start..start + roi.width as usize * 3]);
+            rgb.extend_from_slice(&frame.rgb()[start..start + roi.width as usize * 3]);
         }
-        let mut command = Command::new(&self.executable);
-        command
-            .args([
-                "stdin",
-                "stdout",
-                "-l",
-                &parameters.language,
-                "--psm",
-                &parameters.psm.to_string(),
-                "tsv",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        if let Some(dir) = &self.data_dir {
-            command.env("TESSDATA_PREFIX", dir);
-        }
-        let mut child = command
-            .spawn()
-            .map_err(|e| Error::Backend(format!("cannot start local Tesseract: {e}")))?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::Backend("missing OCR input pipe".into()))?;
-        let write = async move {
-            stdin.write_all(&image).await?;
-            stdin.shutdown().await
-        };
-        let (_, output) = tokio::try_join!(write, child.wait_with_output())
-            .map_err(|e| Error::Backend(e.to_string()))?;
-        if !output.status.success() {
-            return Err(Error::Backend(format!(
-                "Tesseract failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-        let tsv = String::from_utf8(output.stdout).map_err(|e| Error::Backend(e.to_string()))?;
-        parse_tsv(&tsv, roi, parameters)
+        let image = RgbImage::from_raw(roi.width, roi.height, rgb)
+            .ok_or_else(|| Error::Invalid("invalid OCR crop".into()))?;
+        let (reply, response) = oneshot::channel();
+        self.sender
+            .send(Job {
+                image: DynamicImage::ImageRgb8(image),
+                reply,
+                _permit: permit,
+            })
+            .await
+            .map_err(|_| Error::Backend("OCR worker stopped".into()))?;
+        let matches = response
+            .await
+            .map_err(|_| Error::Backend("OCR worker stopped".into()))??;
+        convert(matches, roi, p)
     }
 }
-#[derive(Deserialize)]
+
+#[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct Parameters {
-    #[serde(default = "language")]
-    language: String,
-    #[serde(default = "psm")]
-    psm: u8,
     #[serde(default)]
     min_confidence: f64,
-    /// Optional substring filter; matching remains local and deterministic.
     #[serde(default)]
     contains: Option<String>,
 }
-fn language() -> String {
-    "eng".into()
-}
-fn psm() -> u8 {
-    6
-}
-fn parse_tsv(tsv: &str, roi: Rect, p: &Parameters) -> Result<RecognitionResult, Error> {
-    if !tsv.starts_with("level\t") {
-        return Err(Error::Backend("invalid OCR TSV header".into()));
-    }
+
+fn convert(matches: Vec<Detection>, roi: Rect, p: &Parameters) -> Result<RecognitionResult, Error> {
     let mut result = RecognitionResult::default();
-    for line in tsv.lines().skip(1) {
-        let fields: Vec<_> = line.splitn(12, '\t').collect();
-        if fields.first() != Some(&"5") {
-            continue;
-        }
-        if fields.len() != 12 {
-            return Err(Error::Backend("invalid OCR word row".into()));
-        }
-        let number = |index: usize| {
-            fields[index]
-                .parse::<u32>()
-                .map_err(|_| Error::Backend("invalid OCR geometry".into()))
-        };
-        let (x, y, width, height) = (number(6)?, number(7)?, number(8)?, number(9)?);
-        if width == 0
-            || height == 0
-            || u64::from(x) + u64::from(width) > u64::from(roi.width)
-            || u64::from(y) + u64::from(height) > u64::from(roi.height)
+    for mut item in matches {
+        let score = item.score.unwrap_or(f64::NAN);
+        let bounds = item
+            .bounds
+            .as_mut()
+            .ok_or_else(|| Error::Backend("OCR result missing bounds".into()))?;
+        if !(0.0..=1.0).contains(&score)
+            || bounds.x < 0
+            || bounds.y < 0
+            || bounds.width == 0
+            || bounds.height == 0
+            || bounds.x as u64 + u64::from(bounds.width) > u64::from(roi.width)
+            || bounds.y as u64 + u64::from(bounds.height) > u64::from(roi.height)
         {
-            return Err(Error::Backend("OCR result outside crop".into()));
+            return Err(Error::Backend(
+                "invalid OCR result geometry or confidence".into(),
+            ));
         }
-        let confidence = fields[10]
-            .parse::<f64>()
-            .map_err(|_| Error::Backend("invalid OCR confidence".into()))?
-            / 100.0;
-        if !(0.0..=1.0).contains(&confidence) {
-            return Err(Error::Backend("invalid OCR confidence".into()));
-        }
-        let text = fields[11].trim();
+        let text = item.text.as_deref().unwrap_or("").trim();
         if text.is_empty()
-            || confidence < p.min_confidence
+            || score < p.min_confidence
             || p.contains
                 .as_ref()
                 .is_some_and(|needle| !text.contains(needle))
         {
             continue;
         }
-        result.matches.push(Detection {
-            bounds: Some(Rect {
-                x: roi.x + x as i32,
-                y: roi.y + y as i32,
-                width,
-                height,
-            }),
-            score: Some(confidence),
-            text: Some(text.into()),
-            label: None,
-            detail: Value::Null,
-        });
+        bounds.x += roi.x;
+        bounds.y += roi.y;
+        result.matches.push(item);
     }
     Ok(result)
 }
-impl Recognizer for Tesseract {
+
+impl Recognizer for Ocr {
     fn recognize<'a>(
         &'a mut self,
         frame: &'a Frame,
@@ -172,26 +192,17 @@ impl Recognizer for Tesseract {
         control: &'a Control,
     ) -> RecognitionFuture<'a> {
         Box::pin(async move {
-            let parameters: Parameters = serde_json::from_value(parameters.clone())
-                .map_err(|e| Error::Invalid(e.to_string()))?;
-            if parameters.language.is_empty()
-                || !parameters
-                    .language
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+'))
-                || !(3..=13).contains(&parameters.psm)
-                || !(0.0..=1.0).contains(&parameters.min_confidence)
-                || self.timeout.is_zero()
-            {
-                return Err(Error::Invalid(
-                    "invalid OCR language, psm, confidence or timeout".into(),
-                ));
-            }
             control.check()?;
+            frame.region(Some(roi))?;
+            let p: Parameters = serde_json::from_value(parameters.clone())
+                .map_err(|e| Error::Invalid(e.to_string()))?;
+            if !(0.0..=1.0).contains(&p.min_confidence) || self.timeout.is_zero() {
+                return Err(Error::Invalid("invalid OCR confidence or timeout".into()));
+            }
             tokio::select! {
                 biased;
-                _=control.cancelled()=>Err(Error::Cancelled),
-                result=tokio::time::timeout(self.timeout,self.run(frame,roi,&parameters))=>result.map_err(|_|Error::TimedOut)?,
+                _ = control.cancelled() => Err(Error::Cancelled),
+                result = tokio::time::timeout(self.timeout, self.run(frame, roi, &p)) => result.map_err(|_| Error::TimedOut)?,
             }
         })
     }
@@ -201,49 +212,120 @@ impl Recognizer for Tesseract {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn roi() -> Rect {
-        Rect {
+    #[tokio::test]
+    async fn timeout_does_not_queue_more_inference_and_engine_is_reused() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let (release, gate) = std::sync::mpsc::channel();
+        let mut ocr = Ocr::start(move || {
+            Ok(move |_: DynamicImage| {
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    gate.recv().unwrap();
+                }
+                Ok(vec![])
+            })
+        })
+        .await
+        .unwrap()
+        .with_timeout(Duration::from_millis(30));
+        let frame = Frame::new(1, 1, vec![255; 3]).unwrap();
+        let roi = Rect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        };
+        let p = json!({});
+        let control = Control::default();
+        for _ in 0..2 {
+            assert!(matches!(
+                ocr.recognize(&frame, roi, &p, &control).await,
+                Err(Error::TimedOut)
+            ));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release.send(()).unwrap();
+        ocr.timeout = Duration::from_secs(2);
+        assert!(
+            !ocr.recognize(&frame, roi, &p, &control)
+                .await
+                .unwrap()
+                .matched()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cancellation_keeps_task_control_responsive_during_inference() {
+        let (release, gate) = std::sync::mpsc::channel();
+        let (started, mut running) = oneshot::channel();
+        let mut started = Some(started);
+        let mut ocr = Ocr::start(move || {
+            Ok(move |_: DynamicImage| {
+                if let Some(started) = started.take() {
+                    let _ = started.send(());
+                }
+                gate.recv().unwrap();
+                Ok(vec![])
+            })
+        })
+        .await
+        .unwrap();
+        let frame = Frame::new(1, 1, vec![255; 3]).unwrap();
+        let control = Control::default();
+        let p = json!({});
+        let request = ocr.recognize(
+            &frame,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            &p,
+            &control,
+        );
+        let cancel = async {
+            (&mut running).await.unwrap();
+            control.cancel();
+        };
+        let (result, ()) = tokio::join!(request, cancel);
+        release.send(()).unwrap();
+        assert!(matches!(result, Err(Error::Cancelled)));
+    }
+
+    #[test]
+    fn converts_crop_coordinates_and_filters_text() {
+        let detection = |text: &str| Detection {
+            bounds: Some(Rect {
+                x: 2,
+                y: 3,
+                width: 20,
+                height: 10,
+            }),
+            score: Some(0.95),
+            text: Some(text.into()),
+            label: None,
+            detail: Value::Null,
+        };
+        let roi = Rect {
             x: 100,
             y: 200,
             width: 80,
             height: 40,
-        }
-    }
-
-    #[test]
-    fn words_are_filtered_and_translated_to_frame_coordinates() {
-        let parameters =
-            serde_json::from_value(json!({"contains":"继续", "min_confidence":0.8})).unwrap();
-        let tsv = "level\tpage_num\n5\t1\t1\t1\t1\t1\t2\t3\t20\t10\t95\t继续\n5\t1\t1\t1\t1\t2\t25\t3\t20\t10\t70\t继续\n5\t1\t1\t1\t1\t3\t50\t3\t20\t10\t99\t返回\n";
-        let result = parse_tsv(tsv, roi(), &parameters).unwrap();
+        };
+        let p = Parameters {
+            min_confidence: 0.8,
+            contains: Some("继续".into()),
+        };
+        let result = convert(vec![detection("继续"), detection("返回")], roi, &p).unwrap();
         assert_eq!(result.matches.len(), 1);
         let bounds = result.matches[0].bounds.unwrap();
-        assert_eq!(
-            (bounds.x, bounds.y, bounds.width, bounds.height),
-            (102, 203, 20, 10)
-        );
-        assert_eq!(result.matches[0].score, Some(0.95));
-    }
-
-    #[test]
-    fn malformed_output_is_distinct_from_no_words() {
-        let parameters = serde_json::from_value(json!({})).unwrap();
-        assert!(
-            !parse_tsv("level\tpage_num\n", roi(), &parameters)
-                .unwrap()
-                .matched()
-        );
-        for tsv in [
-            "not TSV",
-            "level\tpage_num\n5\t1",
-            "level\tpage_num\n5\t1\t1\t1\t1\t1\t79\t3\t20\t10\t95\ttext",
-            "level\tpage_num\n5\t1\t1\t1\t1\t1\t2\t3\t20\t10\tNaN\ttext",
-        ] {
-            assert!(matches!(
-                parse_tsv(tsv, roi(), &parameters),
-                Err(Error::Backend(_))
-            ));
-        }
+        assert_eq!((bounds.x, bounds.y), (102, 203));
+        let mut invalid = detection("继续");
+        invalid.score = Some(f64::NAN);
+        assert!(convert(vec![invalid], roi, &p).is_err());
     }
 }

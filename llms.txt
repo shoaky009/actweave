@@ -9,8 +9,8 @@
 - [用户功能契约](crates/adapter-api/src/feature.rs)：Feature、固定枚举与字符串/整数/布尔参数、默认值及严格校验；Adapter::features / prepare_feature 返回共享 ExecutionRequest，不依赖 Core。CLI `--adapter demo --list-features` 无需模型列出功能；Demo repeat_trial 准备请求无副作用。
 
 - [独立自动化模块](crates/automation/src/lib.rs)：不依赖 Core、adapter-api 或模型；共享取消信号与错误类型。
-- [可选本地图像后端](crates/automation-vision/src/lib.rs)：Adapter 单独依赖并向 Recognizers 注册 Templates / Tesseract；不依赖 Core，不调用大模型。模板预加载，支持透明遮罩、ROI、多结果及去重；固定尺寸 RGB 平均绝对误差评分，不支持缩放/旋转，阈值不等同于 OpenCV。OCR 启动本地 Tesseract 进程，需另装引擎与语言数据（eng / chi_sim），支持超时、取消、置信度与单词子串过滤；返回客户区坐标、文字和分数。不同 OCR 后端可继续实现同一个 Recognizer。
-- [离线 OCR 入口](crates/automation-vision/examples/recognize.rs)：`cargo run -p automation-vision --example recognize -- screenshot.png chi_sim`；默认 eng，不需要启动游戏。适配器用 Rust 构建识别定义，算法参数值不是独立 JSON 配置文件。
+- [可选本地图像后端](crates/automation-vision/src/lib.rs)：Adapter 单独依赖并向 Recognizers 注册 Templates / Ocr；不依赖 Core，不调用大模型。模板预加载，支持透明遮罩、ROI、多结果及去重；固定尺寸 RGB 平均绝对误差评分，不支持缩放/旋转，阈值不等同于 OpenCV。OCR 使用 ocr-rs 2.4.1 + MNN CPU，每个实例在独立线程加载一次模型并复用；显式提供配套检测模型、识别模型、字典路径，语言由模型决定。支持 ROI、min_confidence、contains，返回客户区坐标、文字区域和分数。取消/超时立即停止等待，不强杀原生推理；单实例至多一个在途请求，旧推理完成后才接收新请求，等待也计入超时。丢弃实例后线程在当前推理结束后退出。
+- [离线 OCR 入口](crates/automation-vision/examples/recognize.rs)：`cargo run -p automation-vision --example recognize -- screenshot.png det.mnn rec.mnn keys.txt`，不需要启动游戏。运行时不下载模型；构建 ocr-rs 需要 C++ 工具链及 libclang，默认下载上游 MNN 预编译库，不支持的平台需源码构建。发布版 2.4.1 自带 MNN 构建封装，与上游 main 已迁移 mnn-runtime 的实现不同。适配器用 Rust 构建识别定义，算法参数值不是独立 JSON 配置文件。
 - [识别契约与注册](crates/automation/src/recognition.rs)：RGB 帧、客户区像素 ROI、结构化匹配位置/分数/文字/标签；内置 DirectHit、RGB 区域比例匹配、And/Or；预设模板、特征、OCR、神经分类/检测的可注册后端，以及自定义识别。未注册能力在流程启动前拒绝；模板和 OCR 可使用 automation-vision，其他预设尚无内置实现。
 - [动作与平台接口](crates/automation/src/action.rs)：click、long_press、swipe、key_down、key_up、wait、自定义动作；目标可引用本节点识别结果。Backend 负责截图、输入及释放会话输入，真实 Windows 后端尚未接入；后续沿用 GameAutomata 的 windows-sys 路线。
 - [本地流程](crates/automation/src/flow.rs)：JSON 可序列化节点图，entry 也经过识别；next 按优先级检测、首个命中执行。step 每次推进一轮识别或一个动作，保留动作位置；on_error、阶段超时、全局操作预算、步骤边界暂停/恢复、取消及终止释放输入。Progress 保留最近识别、自定义动作结果和最近失败，供 Adapter 转成 state/日志；流程完成不自动等于用户任务完成。
@@ -40,7 +40,7 @@
 
 ## 测试
 
-- [本地图像后端](crates/automation-vision/tests/vision.rs)：合成图验证模板位置、遮罩、多个结果与错误；OCR 模块单测验证文字过滤、坐标转换及异常输出。安装 Tesseract 和 eng 数据后运行 `cargo test -p automation-vision --test vision -- --ignored`，用合成英文图片验证真实引擎；尚未验证原神截图和中文识别效果。
+- [本地图像后端](crates/automation-vision/tests/vision.rs)：合成图验证模板位置、遮罩、多个结果与错误；OCR 模块单测验证文字过滤、坐标转换、取消响应和超时后无推理堆积。`ACTWEAVE_OCR_MODELS=/path/to/models cargo test -p automation-vision --test vision -- --ignored` 使用 PP-OCRv5_mobile_det.mnn、PP-OCRv5_mobile_rec.mnn、ppocr_keys_v5.txt 验证真实引擎；尚未验证原神截图。
 - [本地功能任务](tests/features.rs)：无模型执行、失败停止、暂停/继续/取消，以及 CLI 参数校验。
 
 - [动态识别区域](crates/automation/src/recognition.rs)：Roi::Fixed 使用客户区像素，Roi::Relative 按每次识别的当前帧尺寸解析，边界向外取整并校验；None 表示全帧。颜色、DirectHit、算法及自定义识别共用此入口，OCR 注册接口继续接收解析后的像素 ROI，无额外模型依赖。
