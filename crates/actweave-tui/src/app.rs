@@ -269,18 +269,8 @@ impl App {
         match message {
             Message::Event(event) => match event {
                 TaskEvent::Observed(state) => {
-                    self.log(format!("已观察：{}", state.scene));
                     self.state = Some(state);
                 }
-                TaskEvent::SkillsResolved { skills, .. } => self.log(format!(
-                    "可用 Skills：{}",
-                    skills
-                        .iter()
-                        .filter(|s| s.availability.is_available())
-                        .map(|s| s.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )),
                 TaskEvent::ActionStarted { index, total, call } => self.log(format!(
                     "动作 {}/{}：{} {}",
                     index + 1,
@@ -301,17 +291,6 @@ impl App {
                     self.log(format!("执行失败：{}", failure.message))
                 }
                 TaskEvent::ExecutionRejected(reason) => self.log(format!("拒绝执行：{reason}")),
-                TaskEvent::Decided(decision) => self.log(format!(
-                    "决策：{}",
-                    match decision {
-                        actweave::core::Decision::Execute { .. } => "执行",
-                        actweave::core::Decision::ReplaceRemaining { .. } => "调整计划",
-                        actweave::core::Decision::LoadSkills(_) => "加载 Skill",
-                        actweave::core::Decision::Resume => "继续执行",
-                        actweave::core::Decision::Completed(_) => "完成",
-                        actweave::core::Decision::Failed(_) => "失败",
-                    }
-                )),
                 _ => {}
             },
             Message::Finished(result, instance) => {
