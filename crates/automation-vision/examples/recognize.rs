@@ -1,4 +1,4 @@
-//! cargo run -p automation-vision --example recognize -- <image.png> <det.mnn> <rec.mnn> <keys.txt>
+//! cargo run -p automation-vision --example recognize -- <image.png> [<det.mnn> <rec.mnn> <keys.txt>]
 use automation::{Control, recognition::*};
 use automation_vision::Ocr;
 use serde_json::json;
@@ -6,13 +6,21 @@ use serde_json::json;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let path = args.next().ok_or("provide an image path")?;
-    let det = args.next().ok_or("provide detection model path")?;
-    let rec = args.next().ok_or("provide recognition model path")?;
-    let dictionary = args.next().ok_or("provide dictionary path")?;
+    let ocr = match args.next() {
+        Some(det) => {
+            let rec = args.next().ok_or("provide recognition model path")?;
+            let dictionary = args.next().ok_or("provide dictionary path")?;
+            if args.next().is_some() {
+                return Err("unexpected argument".into());
+            }
+            Ocr::new(det, rec, dictionary).await?
+        }
+        None => Ocr::bundled().await?,
+    };
     let image = image::open(path)?.into_rgb8();
     let frame = Frame::new(image.width(), image.height(), image.into_raw())?;
     let mut recognizers = Recognizers::default();
-    recognizers.register_algorithm(Algorithm::Ocr, Ocr::new(det, rec, dictionary).await?)?;
+    recognizers.register_algorithm(Algorithm::Ocr, ocr)?;
     let result = recognizers
         .recognize(
             &Recognition::Algorithm {

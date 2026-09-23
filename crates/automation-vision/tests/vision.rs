@@ -84,9 +84,8 @@ async fn missing_ocr_models_are_an_initialization_error() {
     ));
 }
 
-/// Explicit integration test; set ACTWEAVE_OCR_MODELS to a PP-OCRv5 model directory.
+/// Runs actual embedded models, without external files or downloads.
 #[tokio::test]
-#[ignore = "requires PP-OCRv5 models and dictionary"]
 async fn real_ocr_reads_generated_text_and_returns_boxes() {
     let patterns = [
         [
@@ -121,16 +120,7 @@ async fn real_ocr_reads_generated_text_and_returns_boxes() {
         }
     }
     let frame = Frame::new(width as u32, height as u32, rgb).unwrap();
-    let models = std::path::PathBuf::from(
-        std::env::var("ACTWEAVE_OCR_MODELS").expect("set ACTWEAVE_OCR_MODELS"),
-    );
-    let mut ocr = Ocr::new(
-        models.join("PP-OCRv5_mobile_det.mnn"),
-        models.join("PP-OCRv5_mobile_rec.mnn"),
-        models.join("ppocr_keys_v5.txt"),
-    )
-    .await
-    .unwrap();
+    let mut ocr = Ocr::bundled().await.unwrap();
     let result = ocr
         .recognize(
             &frame,

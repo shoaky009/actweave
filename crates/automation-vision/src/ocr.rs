@@ -23,6 +23,20 @@ struct Job {
 }
 
 impl Ocr {
+    /// Loads the embedded PP-OCRv6 small detection, recognition and dictionary assets.
+    pub async fn bundled() -> Result<Self, Error> {
+        Self::from_engine(|| {
+            ocr_rs::OcrEngine::from_bytes(
+                include_bytes!("../models/pp-ocrv6-small/PP-OCRv6_small_det.mnn"),
+                include_bytes!("../models/pp-ocrv6-small/PP-OCRv6_small_rec.mnn"),
+                include_bytes!("../models/pp-ocrv6-small/ppocr_keys_v6_small.txt"),
+                None,
+            )
+            .map_err(|e| Error::Backend(e.to_string()))
+        })
+        .await
+    }
+
     /// Model and dictionary files must match. No runtime downloads are performed.
     pub async fn new(
         det: impl Into<PathBuf>,
@@ -30,9 +44,18 @@ impl Ocr {
         dictionary: impl Into<PathBuf>,
     ) -> Result<Self, Error> {
         let (det, rec, dictionary) = (det.into(), rec.into(), dictionary.into());
+        Self::from_engine(move || {
+            ocr_rs::OcrEngine::new(det, rec, dictionary, None)
+                .map_err(|e| Error::Backend(e.to_string()))
+        })
+        .await
+    }
+
+    async fn from_engine(
+        initialize: impl FnOnce() -> Result<ocr_rs::OcrEngine, Error> + Send + 'static,
+    ) -> Result<Self, Error> {
         Self::start(move || {
-            let engine = ocr_rs::OcrEngine::new(det, rec, dictionary, None)
-                .map_err(|e| Error::Backend(e.to_string()))?;
+            let engine = initialize()?;
             Ok(move |image: DynamicImage| {
                 engine
                     .recognize(&image)
