@@ -4,17 +4,12 @@ use crate::core::{
     SkillContext, ToolCall, ToolResult,
 };
 use crate::execution::{ExecutionContext, record_failure};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::time::{Duration, Instant};
 
 pub const MAX_REPEAT: u32 = 100;
 /// A bounded number of executions of the same tool call.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RepeatRequest {
-    pub call: ToolCall,
-    pub times: u32,
-}
+pub use adapter_api::RepeatRequest;
 /// Local repetition stops at a count or on explicit adapter completion.
 #[derive(Debug, Clone, Serialize)]
 pub enum BatchRequest {

@@ -24,6 +24,12 @@ impl Host {
 
 type ExecuteFuture<'a> = Pin<Box<dyn Future<Output = Result<ActionReport, AdapterError>> + 'a>>;
 trait Instance {
+    fn features(&self) -> Result<Vec<Feature>, AdapterError>;
+    fn prepare_feature(
+        &self,
+        id: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<ExecutionRequest, AdapterError>;
     fn observe(&self) -> Result<AppState, AdapterError>;
     fn context(&self, context: &SkillContext<'_>) -> Result<DecisionContext, AdapterError>;
     fn execute<'a>(
@@ -33,6 +39,16 @@ trait Instance {
     ) -> ExecuteFuture<'a>;
 }
 impl<T: Adapter> Instance for T {
+    fn features(&self) -> Result<Vec<Feature>, AdapterError> {
+        Adapter::features(self)
+    }
+    fn prepare_feature(
+        &self,
+        id: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<ExecutionRequest, AdapterError> {
+        Adapter::prepare_feature(self, id, arguments)
+    }
     fn observe(&self) -> Result<AppState, AdapterError> {
         Adapter::observe(self)
     }
@@ -50,6 +66,16 @@ impl<T: Adapter> Instance for T {
 /// Type-erased instance still implements the shared adapter contract.
 pub struct RegisteredAdapter(Box<dyn Instance>);
 impl Adapter for RegisteredAdapter {
+    fn features(&self) -> Result<Vec<Feature>, AdapterError> {
+        self.0.features()
+    }
+    fn prepare_feature(
+        &self,
+        id: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<ExecutionRequest, AdapterError> {
+        self.0.prepare_feature(id, arguments)
+    }
     fn observe(&self) -> Result<AppState, AdapterError> {
         self.0.observe()
     }

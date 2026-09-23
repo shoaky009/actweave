@@ -39,13 +39,7 @@ impl Task {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Action {
-    Call(ToolCall),
-    Repeat(RepeatRequest),
-    /// Execute locally until the adapter explicitly reports Completed.
-    UntilDone(ToolCall),
-}
+pub use adapter_api::Action;
 
 /// Applied only after the action completes normally, never after an interruption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

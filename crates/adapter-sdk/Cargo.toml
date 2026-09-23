@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 adapter-api = { path = "../adapter-api" }
 automation = { path = "../automation" }
+serde_json = "1"

@@ -1,5 +1,9 @@
 //! Shared adapter contract, independent of the execution core and model provider.
 use serde::{Deserialize, Serialize};
+mod feature;
+pub use feature::{
+    Action, Choice, ExecutionRequest, Feature, Parameter, ParameterKind, RepeatRequest,
+};
 use serde_json::Value;
 use std::{
     future::Future,
@@ -195,6 +199,17 @@ fn is_false(value: &bool) -> bool {
 
 /// Adapters validate arguments and hide all concrete runtime operations.
 pub trait Adapter {
+    fn features(&self) -> Result<Vec<Feature>, AdapterError> {
+        Ok(vec![])
+    }
+    /// Validate arguments and construct a request without producing application effects.
+    fn prepare_feature(
+        &self,
+        id: &str,
+        _arguments: &Value,
+    ) -> Result<ExecutionRequest, AdapterError> {
+        Err(AdapterError::Invalid(format!("unsupported feature: {id}")))
+    }
     fn observe(&self) -> Result<AppState, AdapterError>;
     /// Resolve skills and current guidance against host context. Keep unavailable entries
     /// with reasons. Use supplied state/feedback rather than accumulating prompt history.

@@ -61,3 +61,21 @@ async fn debug_host_rejects_unavailable_skills_before_effects() {
         "not_started"
     );
 }
+
+#[test]
+fn feature_preparation_validates_without_effects() {
+    use adapter_sdk::Adapter;
+    let mut registry = Registry::default();
+    register(&mut registry, Scenario::Normal).unwrap();
+    let adapter = registry.create("demo", Host::default()).unwrap();
+    let request = adapter
+        .prepare_feature("repeat_trial", &json!({"times":3}))
+        .unwrap();
+    assert!(matches!(&request.actions[..], [adapter_sdk::Action::Repeat(r)] if r.times==3));
+    assert!(
+        adapter
+            .prepare_feature("repeat_trial", &json!({"times":0}))
+            .is_err()
+    );
+    assert_eq!(adapter.observe().unwrap().facts["trial"]["completed"], 0);
+}

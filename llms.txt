@@ -4,6 +4,8 @@
 
 ## 模块
 
+- [用户功能契约](crates/adapter-api/src/feature.rs)：Feature、固定枚举与字符串/整数/布尔参数、默认值及严格校验；Adapter::features / prepare_feature 返回共享 ExecutionRequest，不依赖 Core。CLI `--adapter demo --list-features` 无需模型列出功能；Demo repeat_trial 准备请求无副作用。
+
 - [独立自动化模块](crates/automation/src/lib.rs)：不依赖 Core、adapter-api 或模型；共享取消信号与错误类型。
 - [识别契约与注册](crates/automation/src/recognition.rs)：RGB 帧、客户区像素 ROI、结构化匹配位置/分数/文字/标签；内置 DirectHit、RGB 区域比例匹配、And/Or；预设模板、特征、OCR、神经分类/检测的可注册后端，以及自定义识别。未注册能力在流程启动前拒绝，尚不附带这些模型或算法实现。
 - [动作与平台接口](crates/automation/src/action.rs)：click、long_press、swipe、key_down、key_up、wait、自定义动作；目标可引用本节点识别结果。Backend 负责截图、输入及释放会话输入，真实 Windows 后端尚未接入；后续沿用 GameAutomata 的 windows-sys 路线。

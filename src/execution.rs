@@ -104,14 +104,6 @@ impl<G: Adapter, F: FnMut(Event)> ExecutionContext<'_, G, F> {
         })
     }
 }
-impl Action {
-    pub fn call(&self) -> &ToolCall {
-        match self {
-            Self::Call(call) | Self::UntilDone(call) => call,
-            Self::Repeat(request) => &request.call,
-        }
-    }
-}
 impl ActiveExecution {
     pub fn replace_remaining(
         &mut self,

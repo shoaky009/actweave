@@ -68,7 +68,10 @@ enum Injection {
 #[command(about = "可切换决策器的语义工具调用 MVP")]
 struct Args {
     /// 自然语言任务，例如：切换到训练模式
-    task: String,
+    task: Option<String>,
+    /// 列出所选适配器的用户功能及参数，不启动任务或模型
+    #[arg(long, conflicts_with = "task")]
+    list_features: bool,
     /// 宿主选择适配器；只加载此实例提供的状态和 Skills
     #[arg(long, default_value = "demo")]
     adapter: String,
@@ -126,10 +129,23 @@ async fn main() -> ExitCode {
     }
 }
 async fn execute(args: Args) -> Result<bool, Box<dyn std::error::Error>> {
-    let task = Task::new(&args.task)?;
     let mut registry = adapter_sdk::Registry::default();
     adapter::register(&mut registry, args.scenario.into())?;
     let mut environment = registry.create(&args.adapter, adapter_sdk::Host::default())?;
+    if args.list_features {
+        for feature in adapter_sdk::Adapter::features(&environment)? {
+            feature.validate()?;
+            println!("{} — {}：{}", feature.id, feature.name, feature.description);
+            for parameter in feature.parameters {
+                println!(
+                    "  {} ({}) {:?}，默认值 {:?}",
+                    parameter.id, parameter.name, parameter.kind, parameter.default
+                );
+            }
+        }
+        return Ok(true);
+    }
+    let task = Task::new(args.task.as_deref().ok_or("请提供任务或 --list-features")?)?;
     if matches!(args.agent, AgentKind::Manual) && (args.endpoint.is_some() || args.model.is_some())
     {
         return Err("manual 决策器不使用 --endpoint 或 --model".into());

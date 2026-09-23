@@ -28,6 +28,9 @@ impl Runtime {
     pub fn observe(&self) -> Result<AppState, AdapterError> {
         self.adapter.observe()
     }
+    pub fn features(&self) -> Result<Vec<Feature>, AdapterError> {
+        self.adapter.features()
+    }
     pub fn skills(&self) -> Result<DecisionContext, AdapterError> {
         let state = self.observe()?;
         self.adapter.decision_context(&SkillContext {

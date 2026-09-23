@@ -149,6 +149,44 @@ fn guidance(snapshot: &Snapshot, context: &SkillContext<'_>) -> String {
 }
 
 impl Adapter for DemoAdapter {
+    fn features(&self) -> Result<Vec<adapter_sdk::Feature>, Error> {
+        use adapter_sdk::{Feature, Parameter, ParameterKind};
+        Ok(vec![Feature {
+            id: "repeat_trial".into(),
+            name: "重复试验".into(),
+            description: "执行指定次数的试验；没有收益也算完成一次。".into(),
+            parameters: vec![Parameter {
+                id: "times".into(),
+                name: "次数".into(),
+                kind: ParameterKind::Integer { min: 1, max: 100 },
+                default: Some(json!(10)),
+            }],
+        }])
+    }
+    fn prepare_feature(
+        &self,
+        id: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<adapter_sdk::ExecutionRequest, Error> {
+        let feature = self
+            .features()?
+            .into_iter()
+            .find(|f| f.id == id)
+            .ok_or_else(|| Error::Invalid(format!("unknown feature: {id}")))?;
+        let arguments = feature.resolve(arguments)?;
+        let times = arguments["times"]
+            .as_u64()
+            .ok_or_else(|| Error::Invalid("missing times".into()))? as u32;
+        Ok(adapter_sdk::ExecutionRequest {
+            actions: vec![adapter_sdk::Action::Repeat(adapter_sdk::RepeatRequest {
+                call: ToolCall {
+                    name: "perform_trial".into(),
+                    arguments: json!({}),
+                },
+                times,
+            })],
+        })
+    }
     fn observe(&self) -> Result<AppState, Error> {
         let (completed, successful, ready, needs_reset) = self.runtime.trial_snapshot();
         let mut state = AppState {
