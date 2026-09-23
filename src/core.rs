@@ -298,6 +298,11 @@ pub(crate) async fn run_managed<A: Agent, G: Adapter>(
     runtime: &crate::task_runtime::TaskHandle,
     emit: impl FnMut(Event),
 ) -> Result<Outcome, Error> {
+    validate_options(task, &options)?;
+    run_decisions(task, agent, environment, options, runtime, emit).await
+}
+
+fn validate_options(task: &Task, options: &RunOptions) -> Result<(), Error> {
     if task.goal.trim().is_empty()
         || options.max_decisions == 0
         || options.max_repeated_failures == 0
@@ -315,6 +320,84 @@ pub(crate) async fn run_managed<A: Agent, G: Adapter>(
             "nonempty task and positive bounded execution budgets required".into(),
         ));
     }
+    Ok(())
+}
+
+pub(crate) async fn run_request_managed<G: Adapter>(
+    task: &Task,
+    request: adapter_api::ExecutionRequest,
+    environment: &mut G,
+    mut options: RunOptions,
+    runtime: &crate::task_runtime::TaskHandle,
+    emit: impl FnMut(Event),
+) -> Result<Outcome, Error> {
+    // Direct requests don't consume a decision budget or use model skill discovery.
+    options.max_decisions = 1;
+    options.skill_mode = SkillMode::All;
+    validate_options(task, &options)?;
+    let mut ctx = ExecutionContext {
+        failures: Default::default(),
+        task,
+        environment,
+        options: &options,
+        runtime,
+        state: AppState {
+            scene: "unobserved".into(),
+            facts: serde_json::json!({}),
+        },
+        previous: None,
+        failure: None,
+        interruption: None,
+        emit,
+    };
+    runtime.checkpoint(None).await?;
+    if options.cancellation.is_cancelled() {
+        return Ok(finish(
+            Status::Cancelled,
+            "cancelled before start".into(),
+            0,
+            ctx.state,
+            None,
+        ));
+    }
+    ctx.observe()?;
+    let context = ctx.decision_context(0)?;
+    let selected = context.skills.iter().map(|s| s.name.clone()).collect();
+    if let Err(failure) = validate_actions(&request.actions, &context.skills, &selected, &options) {
+        ctx.fail(failure.stage, failure.call, failure.message.clone());
+        return Ok(finish(Status::Failed, failure.message, 0, ctx.state, None));
+    }
+    let mut execution = ActiveExecution::new(request.actions, Continuation::Finish);
+    execution.drive(&mut ctx, 0, &selected).await?;
+    if execution.progress.status == ExecutionStatus::Interrupted {
+        execution.stop(
+            ExecutionStatus::Failed,
+            execution.progress.message.clone(),
+            &mut ctx.emit,
+        );
+    }
+    let status = match execution.progress.status {
+        ExecutionStatus::Completed => Status::Completed,
+        ExecutionStatus::Cancelled => Status::Cancelled,
+        _ => Status::Failed,
+    };
+    Ok(finish(
+        status,
+        execution.progress.message.clone(),
+        0,
+        ctx.state,
+        Some(&execution),
+    ))
+}
+
+async fn run_decisions<A: Agent, G: Adapter>(
+    task: &Task,
+    agent: &mut A,
+    environment: &mut G,
+    options: RunOptions,
+    runtime: &crate::task_runtime::TaskHandle,
+    emit: impl FnMut(Event),
+) -> Result<Outcome, Error> {
     let mut ctx = ExecutionContext {
         failures: Default::default(),
         task,

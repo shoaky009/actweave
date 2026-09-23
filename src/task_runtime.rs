@@ -280,19 +280,53 @@ impl TaskRuntime {
             },
         )
         .await;
-        if let Err(e) = self.handle.check_log() {
-            result = Err(e);
-        }
-        self.handle.finish(&result);
-        if let Err(e) = self.handle.check_log() {
-            result = Err(e);
-            self.handle.finish(&result);
-        }
-        if let Ok(outcome) = &mut result {
-            outcome.summary = self.handle.metrics.finish();
-        }
+        self.finish_run(&mut result);
         drop(guard);
         result
+    }
+    /// Execute a prepared feature through the same lifecycle, metrics and controls.
+    pub async fn run_request(
+        self,
+        request: adapter_api::ExecutionRequest,
+        environment: &mut impl Adapter,
+        mut emit: impl FnMut(Event),
+    ) -> Result<Outcome, Error> {
+        self.handle.metrics.start();
+        let guard = RunGuard(self.handle.clone());
+        self.handle
+            .transition(&[TaskStatus::Created], TaskStatus::Running);
+        let mut measured_adapter = MeasuredAdapter {
+            inner: environment,
+            metrics: self.handle.metrics.clone(),
+        };
+        let mut result = crate::core::run_request_managed(
+            &self.task,
+            request,
+            &mut measured_adapter,
+            self.options.clone(),
+            &self.handle,
+            |event| {
+                self.handle.event(&event);
+                emit(event);
+            },
+        )
+        .await;
+        self.finish_run(&mut result);
+        drop(guard);
+        result
+    }
+    fn finish_run(&self, result: &mut Result<Outcome, Error>) {
+        if let Err(e) = self.handle.check_log() {
+            *result = Err(e);
+        }
+        self.handle.finish(result);
+        if let Err(e) = self.handle.check_log() {
+            *result = Err(e);
+            self.handle.finish(result);
+        }
+        if let Ok(outcome) = result {
+            outcome.summary = self.handle.metrics.finish();
+        }
     }
 }
 struct RunGuard(TaskHandle);

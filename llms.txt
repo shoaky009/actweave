@@ -4,6 +4,8 @@
 
 ## 模块
 
+- [本地功能任务](src/task_runtime.rs)：run_request 接收 Adapter 准备的 ExecutionRequest，复用执行引擎、控制信号、日志和统计；零决策、零模型请求，中断直接失败。CLI `--adapter demo --feature repeat_trial --param times=10`；暂停在 Skill 边界生效，调用内部仍需 Adapter 协作取消，不承诺即时暂停平台动作。
+
 - [用户功能契约](crates/adapter-api/src/feature.rs)：Feature、固定枚举与字符串/整数/布尔参数、默认值及严格校验；Adapter::features / prepare_feature 返回共享 ExecutionRequest，不依赖 Core。CLI `--adapter demo --list-features` 无需模型列出功能；Demo repeat_trial 准备请求无副作用。
 
 - [独立自动化模块](crates/automation/src/lib.rs)：不依赖 Core、adapter-api 或模型；共享取消信号与错误类型。

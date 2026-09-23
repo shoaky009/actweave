@@ -70,8 +70,14 @@ struct Args {
     /// 自然语言任务，例如：切换到训练模式
     task: Option<String>,
     /// 列出所选适配器的用户功能及参数，不启动任务或模型
-    #[arg(long, conflicts_with = "task")]
+    #[arg(long, conflicts_with_all = ["task", "feature", "param"])]
     list_features: bool,
+    /// 直接运行适配器功能，无需模型或密钥
+    #[arg(long, conflicts_with_all = ["task", "agent", "endpoint", "model"])]
+    feature: Option<String>,
+    /// 功能参数，例如 --param times=10
+    #[arg(long, requires = "feature")]
+    param: Vec<String>,
     /// 宿主选择适配器；只加载此实例提供的状态和 Skills
     #[arg(long, default_value = "demo")]
     adapter: String,
@@ -145,7 +151,24 @@ async fn execute(args: Args) -> Result<bool, Box<dyn std::error::Error>> {
         }
         return Ok(true);
     }
-    let task = Task::new(args.task.as_deref().ok_or("请提供任务或 --list-features")?)?;
+    let request = if let Some(id) = &args.feature {
+        use adapter_sdk::Adapter;
+        let feature = environment
+            .features()?
+            .into_iter()
+            .find(|f| &f.id == id)
+            .ok_or_else(|| format!("未知功能：{id}"))?;
+        let arguments = feature.parse_arguments(&args.param)?;
+        Some(environment.prepare_feature(id, &arguments)?)
+    } else {
+        None
+    };
+    let task = Task::new(
+        args.task
+            .as_deref()
+            .or(args.feature.as_deref())
+            .ok_or("请提供任务、--feature 或 --list-features")?,
+    )?;
     if matches!(args.agent, AgentKind::Manual) && (args.endpoint.is_some() || args.model.is_some())
     {
         return Err("manual 决策器不使用 --endpoint 或 --model".into());
@@ -197,6 +220,17 @@ async fn execute(args: Args) -> Result<bool, Box<dyn std::error::Error>> {
         },
         None => Box::new(std::io::sink()),
     };
+    if let Some(request) = request {
+        return execute_with(
+            runtime,
+            &args,
+            None::<&mut JevAgent>,
+            "本地功能",
+            &mut environment,
+            Some(request),
+        )
+        .await;
+    }
     match args.agent {
         AgentKind::Jev => {
             let key = std::env::var("JEVKEY").map_err(|_| "请设置环境变量 JEVKEY")?;
@@ -211,13 +245,29 @@ async fn execute(args: Args) -> Result<bool, Box<dyn std::error::Error>> {
                 .or_else(|| std::env::var("JEV_MODEL").ok())
                 .unwrap_or_else(|| DEFAULT_MODEL.into());
             let mut agent = JevAgent::new(key, endpoint, model)?.with_log_writer(writer);
-            execute_with(runtime, &args, &mut agent, "JEV", &mut environment).await
+            execute_with(
+                runtime,
+                &args,
+                Some(&mut agent),
+                "JEV",
+                &mut environment,
+                None,
+            )
+            .await
         }
         AgentKind::Manual => {
             let mut agent =
                 ManualAgent::new(std::io::BufReader::new(std::io::stdin()), std::io::stderr())
                     .with_log_writer(writer);
-            execute_with(runtime, &args, &mut agent, "Manual", &mut environment).await
+            execute_with(
+                runtime,
+                &args,
+                Some(&mut agent),
+                "Manual",
+                &mut environment,
+                None,
+            )
+            .await
         }
     }
 }
@@ -226,14 +276,17 @@ async fn execute(args: Args) -> Result<bool, Box<dyn std::error::Error>> {
 async fn execute_with(
     runtime: TaskRuntime,
     args: &Args,
-    agent: &mut impl Agent,
+    agent: Option<&mut impl Agent>,
     agent_name: &str,
     environment: &mut adapter_sdk::RegisteredAdapter,
+    request: Option<adapter_sdk::ExecutionRequest>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     println!("[INFO] 决策器：{agent_name}");
     println!("[INFO] 适配器：{}", args.adapter);
     println!("[INFO] 开始任务：{}", runtime.handle().snapshot().goal);
-    println!("[INFO] 最多执行 {} 轮决策", args.max_decisions);
+    if request.is_none() {
+        println!("[INFO] 最多执行 {} 轮决策", args.max_decisions);
+    }
     let handle = runtime.handle();
     let summary_handle = handle.clone();
     let signal_task = tokio::spawn(async move {
@@ -242,195 +295,202 @@ async fn execute_with(
             eprintln!("[WARN] 已请求取消，将在安全操作边界停止");
         }
     });
-    let mut step = 0;
-    let outcome = runtime
-        .run(agent, environment, |event| match event {
-            Event::Observed(_) => {
-                println!(
-                    "[INFO] 已{}当前状态",
-                    if step == 0 { "读取" } else { "更新" }
-                );
+    let local = request.is_some();
+    let mut step = if local { 1 } else { 0 };
+    let emit = |event| match event {
+        Event::Observed(_) => {
+            println!(
+                "[INFO] 已{}当前状态",
+                if step == 0 { "读取" } else { "更新" }
+            );
+        }
+        Event::SkillsResolved {
+            step,
+            skills,
+            guidance,
+        } => {
+            if !guidance.is_empty() {
+                println!("[INFO] 本轮指导：{guidance}");
             }
-            Event::SkillsResolved {
-                step,
-                skills,
-                guidance,
-            } => {
-                if !guidance.is_empty() {
-                    println!("[INFO] 本轮指导：{guidance}");
-                }
-                let available: Vec<_> = skills
-                    .iter()
-                    .filter(|skill| skill.availability.is_available())
-                    .map(|skill| skill.name.as_str())
-                    .collect();
-                println!(
-                    "[INFO] 第 {step} 步：可用 Skills：{}",
-                    if available.is_empty() {
-                        "无".into()
-                    } else {
-                        available.join(", ")
-                    }
-                );
-                for skill in &skills {
-                    if let Availability::Unavailable { reason } = &skill.availability {
-                        println!("[INFO] Skill `{}` 暂不可用：{reason}", skill.name);
-                    }
-                }
-            }
-            Event::SkillsInjected {
-                names,
-                directory_count,
-            } => {
-                println!(
-                    "[INFO] 本轮已加载 Skills：{}；轻量目录 {} 项",
-                    if names.is_empty() {
-                        "无".into()
-                    } else {
-                        names.join(", ")
-                    },
-                    directory_count
-                );
-                println!("[INFO] 第 {} 步：正在等待决策器选择…", step + 1);
-            }
-            Event::SkillsLoaded(result) => {
-                if result.success {
-                    println!("[INFO] 已更新加载范围：{}", result.selected.join(", "));
+            let available: Vec<_> = skills
+                .iter()
+                .filter(|skill| skill.availability.is_available())
+                .map(|skill| skill.name.as_str())
+                .collect();
+            println!(
+                "[INFO] 第 {step} 步：可用 Skills：{}",
+                if available.is_empty() {
+                    "无".into()
                 } else {
-                    println!("[WARN] 加载失败：{}", result.message);
+                    available.join(", ")
+                }
+            );
+            for skill in &skills {
+                if let Availability::Unavailable { reason } = &skill.availability {
+                    println!("[INFO] Skill `{}` 暂不可用：{reason}", skill.name);
                 }
             }
-            Event::Decided(decision) => {
-                step += 1;
-                if let Decision::Execute { then, .. } | Decision::ReplaceRemaining { then, .. } =
-                    &decision
-                {
-                    println!(
-                        "[INFO] 动作完成后：{}",
-                        match then {
-                            Continuation::Decide => "继续决策",
-                            Continuation::Finish => "结束任务",
-                        }
-                    );
-                }
-                match decision {
-                    Decision::Execute { actions, .. } => {
-                        println!("[INFO] 第 {step} 步：下达 {} 个有序动作", actions.len());
-                        for action in actions {
-                            if let Action::UntilDone(call) = &action {
-                                println!(
-                                    "[INFO] 循环 `{}`：由 Adapter 确认完成，正常步骤无需模型决策",
-                                    call.name
-                                );
-                            }
-                            if let Action::Repeat(request) = action {
-                                println!(
-                                    "[INFO] 批次 `{}`：目标 {} 次动作",
-                                    request.call.name, request.times
-                                );
-                            }
-                        }
-                    }
-                    Decision::ReplaceRemaining { actions, .. } => {
-                        println!(
-                            "[INFO] 第 {step} 步：替换剩余计划，共 {} 个动作，保留已完成进度",
-                            actions.len()
-                        );
-                    }
-                    Decision::Resume => {
-                        println!("[INFO] 第 {step} 步：恢复原执行，继续剩余动作")
-                    }
-                    Decision::LoadSkills(request) => println!(
-                        "[INFO] 第 {step} 步：请求加载 Skills，名称：{:?}，tags：{:?}",
-                        request.names, request.tags
-                    ),
-                    Decision::Completed(_) => {
-                        println!("[INFO] 第 {step} 步：决策器判断任务已完成")
-                    }
-                    Decision::Failed(_) => {
-                        println!("[WARN] 第 {step} 步：决策器判断当前能力与状态无法完成任务")
-                    }
-                }
-            }
-            Event::BatchProgress(progress) => {
-                let completion = match &progress.request {
-                    actweave::core::BatchRequest::Repeat(request) => {
-                        format!("已完成 {}/{} 次", progress.completed, request.times)
-                    }
-                    actweave::core::BatchRequest::UntilDone(_) => format!(
-                        "已执行 {} 步，{}",
-                        progress.completed,
-                        if progress.finished {
-                            "Adapter 已确认完成"
-                        } else {
-                            "等待 Adapter 确认完成"
-                        }
-                    ),
-                };
-                println!(
-                    "[INFO] 批次 `{}`：{}，达成效果 {} 次，尝试 {} 次，状态 {:?}",
-                    progress.request.call().name,
-                    completion,
-                    progress.successful,
-                    progress.attempts,
-                    progress.status
-                );
-                if progress.status == actweave::core::BatchStatus::Interrupted {
-                    println!(
-                        "[WARN] 批次中断：{}；{}，交回决策器处理",
-                        progress.message,
-                        progress
-                            .remaining
-                            .map_or_else(|| "剩余工作量未知".into(), |n| format!("剩余 {n} 次"))
-                    );
-                }
-            }
-            Event::ActionStarted { index, total, call } => println!(
-                "[INFO] 动作 {}/{}：选择 Skill `{}`，参数：{}；开始调用",
-                index + 1,
-                total,
-                call.name,
-                call.arguments
-            ),
-            Event::ExecutionProgress(progress) => {
-                if progress.status == actweave::core::ExecutionStatus::Interrupted {
-                    println!(
-                        "[WARN] 执行中断：已完成 {}/{} 个动作；{}",
-                        progress.completed,
-                        progress.actions.len(),
-                        progress.message
-                    );
-                }
-            }
-            Event::ExecutionFailed(failure) => {
-                let stage = match failure.stage {
-                    actweave::core::FailureStage::Observation => "观察",
-                    actweave::core::FailureStage::Context => "上下文生成",
-                    actweave::core::FailureStage::Availability => "前置条件检查",
-                    actweave::core::FailureStage::Execution => "动作执行",
-                    actweave::core::FailureStage::Validation => "计划校验",
-                };
-                println!("[WARN] {stage}失败：{}", failure.message);
-            }
-            Event::ExecutionRejected(reason) => println!("[WARN] 拒绝执行：{reason}"),
-            Event::Executed(result) => {
-                if result.success {
-                    println!(
-                        "[INFO] 第 {step} 步：Skill `{}` 调用成功：{}",
-                        result.call.name, result.message
-                    );
+        }
+        Event::SkillsInjected {
+            names,
+            directory_count,
+        } => {
+            println!(
+                "[INFO] 本轮已加载 Skills：{}；轻量目录 {} 项",
+                if names.is_empty() {
+                    "无".into()
                 } else {
-                    println!(
-                        "[WARN] 第 {step} 步：Skill `{}` 调用失败：{}",
-                        result.call.name, result.message
-                    );
-                    if step < args.max_decisions {
-                        println!("[INFO] 已记录失败原因，供后续决策使用");
+                    names.join(", ")
+                },
+                directory_count
+            );
+            println!("[INFO] 第 {} 步：正在等待决策器选择…", step + 1);
+        }
+        Event::SkillsLoaded(result) => {
+            if result.success {
+                println!("[INFO] 已更新加载范围：{}", result.selected.join(", "));
+            } else {
+                println!("[WARN] 加载失败：{}", result.message);
+            }
+        }
+        Event::Decided(decision) => {
+            step += 1;
+            if let Decision::Execute { then, .. } | Decision::ReplaceRemaining { then, .. } =
+                &decision
+            {
+                println!(
+                    "[INFO] 动作完成后：{}",
+                    match then {
+                        Continuation::Decide => "继续决策",
+                        Continuation::Finish => "结束任务",
+                    }
+                );
+            }
+            match decision {
+                Decision::Execute { actions, .. } => {
+                    println!("[INFO] 第 {step} 步：下达 {} 个有序动作", actions.len());
+                    for action in actions {
+                        if let Action::UntilDone(call) = &action {
+                            println!(
+                                "[INFO] 循环 `{}`：由 Adapter 确认完成，正常步骤无需模型决策",
+                                call.name
+                            );
+                        }
+                        if let Action::Repeat(request) = action {
+                            println!(
+                                "[INFO] 批次 `{}`：目标 {} 次动作",
+                                request.call.name, request.times
+                            );
+                        }
                     }
                 }
+                Decision::ReplaceRemaining { actions, .. } => {
+                    println!(
+                        "[INFO] 第 {step} 步：替换剩余计划，共 {} 个动作，保留已完成进度",
+                        actions.len()
+                    );
+                }
+                Decision::Resume => {
+                    println!("[INFO] 第 {step} 步：恢复原执行，继续剩余动作")
+                }
+                Decision::LoadSkills(request) => println!(
+                    "[INFO] 第 {step} 步：请求加载 Skills，名称：{:?}，tags：{:?}",
+                    request.names, request.tags
+                ),
+                Decision::Completed(_) => {
+                    println!("[INFO] 第 {step} 步：决策器判断任务已完成")
+                }
+                Decision::Failed(_) => {
+                    println!("[WARN] 第 {step} 步：决策器判断当前能力与状态无法完成任务")
+                }
             }
-        })
-        .await;
+        }
+        Event::BatchProgress(progress) => {
+            let completion = match &progress.request {
+                actweave::core::BatchRequest::Repeat(request) => {
+                    format!("已完成 {}/{} 次", progress.completed, request.times)
+                }
+                actweave::core::BatchRequest::UntilDone(_) => format!(
+                    "已执行 {} 步，{}",
+                    progress.completed,
+                    if progress.finished {
+                        "Adapter 已确认完成"
+                    } else {
+                        "等待 Adapter 确认完成"
+                    }
+                ),
+            };
+            println!(
+                "[INFO] 批次 `{}`：{}，达成效果 {} 次，尝试 {} 次，状态 {:?}",
+                progress.request.call().name,
+                completion,
+                progress.successful,
+                progress.attempts,
+                progress.status
+            );
+            if progress.status == actweave::core::BatchStatus::Interrupted {
+                println!(
+                    "[WARN] 批次中断：{}；{}，交回决策器处理",
+                    progress.message,
+                    progress
+                        .remaining
+                        .map_or_else(|| "剩余工作量未知".into(), |n| format!("剩余 {n} 次"))
+                );
+            }
+        }
+        Event::ActionStarted { index, total, call } => println!(
+            "[INFO] 动作 {}/{}：选择 Skill `{}`，参数：{}；开始调用",
+            index + 1,
+            total,
+            call.name,
+            call.arguments
+        ),
+        Event::ExecutionProgress(progress) => {
+            if progress.status == actweave::core::ExecutionStatus::Interrupted {
+                println!(
+                    "[WARN] 执行中断：已完成 {}/{} 个动作；{}",
+                    progress.completed,
+                    progress.actions.len(),
+                    progress.message
+                );
+            }
+        }
+        Event::ExecutionFailed(failure) => {
+            let stage = match failure.stage {
+                actweave::core::FailureStage::Observation => "观察",
+                actweave::core::FailureStage::Context => "上下文生成",
+                actweave::core::FailureStage::Availability => "前置条件检查",
+                actweave::core::FailureStage::Execution => "动作执行",
+                actweave::core::FailureStage::Validation => "计划校验",
+            };
+            println!("[WARN] {stage}失败：{}", failure.message);
+        }
+        Event::ExecutionRejected(reason) => println!("[WARN] 拒绝执行：{reason}"),
+        Event::Executed(result) => {
+            if result.success {
+                println!(
+                    "[INFO] 第 {step} 步：Skill `{}` 调用成功：{}",
+                    result.call.name, result.message
+                );
+            } else {
+                println!(
+                    "[WARN] 第 {step} 步：Skill `{}` 调用失败：{}",
+                    result.call.name, result.message
+                );
+                if !local && step < args.max_decisions {
+                    println!("[INFO] 已记录失败原因，供后续决策使用");
+                }
+            }
+        }
+    };
+    let outcome = match request {
+        Some(request) => runtime.run_request(request, environment, emit).await,
+        None => {
+            runtime
+                .run(agent.ok_or("缺少决策器")?, environment, emit)
+                .await
+        }
+    };
     signal_task.abort();
     if let Ok(outcome) = &outcome {
         match outcome.status {
