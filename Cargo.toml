@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/adapter-api", "crates/adapter-sdk", "crates/adapter-runtime", "crates/demo-adapter", "crates/automation"]
+members = ["crates/adapter-api", "crates/adapter-sdk", "crates/adapter-runtime", "crates/demo-adapter", "crates/automation", "crates/automation-vision"]
 resolver = "3"
 
 [package]
