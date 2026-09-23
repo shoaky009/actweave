@@ -1,70 +1,51 @@
-# 项目代码导航
+# 项目代码索引
 
-> Rust 任务执行框架。模型选择动作，Core 管理执行，Adapter 处理程序状态与平台操作。本文仅索引职责与路径，接口和行为以对应源码及测试为准。
+## 入口
 
-## 模块
+- [项目说明](README.md)
+- [工作区配置](Cargo.toml)
+- [Library 入口](src/lib.rs)
+- [CLI](src/bin/actweave.rs)
 
-- [本地功能任务](src/task_runtime.rs)：run_request 接收 Adapter 准备的 ExecutionRequest，复用执行引擎、控制信号、日志和统计；零决策、零模型请求，中断直接失败。CLI `--adapter demo --feature repeat_trial --param times=10`；暂停在 Skill 边界生效，调用内部仍需 Adapter 协作取消，不承诺即时暂停平台动作。
+## 任务与决策
 
-- [用户功能契约](crates/adapter-api/src/feature.rs)：Feature、固定枚举与字符串/整数/布尔参数、默认值及严格校验；Adapter::features / prepare_feature 返回共享 ExecutionRequest，不依赖 Core。CLI `--adapter demo --list-features` 无需模型列出功能；Demo repeat_trial 准备请求无副作用。
+- [Core 编排](src/core.rs)
+- [任务 Runtime](src/task_runtime.rs)
+- [有序执行](src/execution.rs)
+- [重复执行](src/batch.rs)
+- [重复失败保护](src/failure_guard.rs)
+- [Skill 加载](src/skills.rs)
+- [任务统计](src/metrics.rs)
+- [决策日志](src/diagnostics.rs)
+- [JEV 决策器](src/jev.rs)
+- [手动决策器](src/manual.rs)
 
-- [独立自动化模块](crates/automation/src/lib.rs)：不依赖 Core、adapter-api 或模型；共享取消信号与错误类型。
-- [可选本地图像后端](crates/automation-vision/src/lib.rs)：Adapter 单独依赖并向 Recognizers 注册 Templates / Ocr；不依赖 Core，不调用大模型。模板预加载，支持透明遮罩、ROI、多结果及去重；固定尺寸 RGB 平均绝对误差评分，不支持缩放/旋转，阈值不等同于 OpenCV。OCR 使用 ocr-rs 2.4.1 + MNN CPU，每个实例在独立线程加载一次模型并复用；显式提供配套检测模型、识别模型、字典路径，语言由模型决定。支持 ROI、min_confidence、contains，返回客户区坐标、文字区域和分数。取消/超时立即停止等待，不强杀原生推理；单实例至多一个在途请求，旧推理完成后才接收新请求，等待也计入超时。丢弃实例后线程在当前推理结束后退出。
-- [离线 OCR 入口](crates/automation-vision/examples/recognize.rs)：`cargo run -p automation-vision --example recognize -- screenshot.png det.mnn rec.mnn keys.txt`，不需要启动游戏。运行时不下载模型；构建 ocr-rs 需要 C++ 工具链及 libclang，默认下载上游 MNN 预编译库，不支持的平台需源码构建。发布版 2.4.1 自带 MNN 构建封装，与上游 main 已迁移 mnn-runtime 的实现不同。适配器用 Rust 构建识别定义，算法参数值不是独立 JSON 配置文件。
-- [识别契约与注册](crates/automation/src/recognition.rs)：RGB 帧、客户区像素 ROI、结构化匹配位置/分数/文字/标签；内置 DirectHit、RGB 区域比例匹配、And/Or；预设模板、特征、OCR、神经分类/检测的可注册后端，以及自定义识别。未注册能力在流程启动前拒绝；模板和 OCR 可使用 automation-vision，其他预设尚无内置实现。
-- [动作与平台接口](crates/automation/src/action.rs)：click、long_press、swipe、key_down、key_up、wait、自定义动作；目标可引用本节点识别结果。Backend 负责截图、输入及释放会话输入，真实 Windows 后端尚未接入；后续沿用 GameAutomata 的 windows-sys 路线。
-- [本地流程](crates/automation/src/flow.rs)：JSON 可序列化节点图，entry 也经过识别；next 按优先级检测、首个命中执行。step 每次推进一轮识别或一个动作，保留动作位置；on_error、阶段超时、全局操作预算、步骤边界暂停/恢复、取消及终止释放输入。Progress 保留最近识别、自定义动作结果和最近失败，供 Adapter 转成 state/日志；流程完成不自动等于用户任务完成。
-- [流程演示](crates/automation/examples/dialogue.rs)：`cargo run -p automation --example dialogue`，mock 截图及输入演示识别提示、点击、重新观察并确认结束；不调用模型、不操作真实窗口。Adapter 持有 Runner 并映射 Skill，普通推进映射 Continue、业务完成映射 Completed、失败映射 Interrupted；不要每次 execute 重建 Runner。调用者丢弃执行前应 cancel 并等待清理，不能依赖异步 Drop 释放输入；暂停在 step 边界生效，持键期间需由平台/Adapter 制定安全暂停策略。
+## 适配器
 
-- [工作区配置](Cargo.toml)：crate 成员、根包依赖与构建配置。
-- [Library 入口](src/lib.rs)：公开模块与 Demo 重导出。
-- [独立 Adapter 契约](crates/adapter-api/src/lib.rs)：Adapter、Skill、SkillContext、DecisionContext；`decision_context` 返回 Skills 与本轮 guidance，输入最近结果、分阶段失败及未解决中断；统一异步 execute，不依赖 Core。
-- [Adapter SDK](crates/adapter-sdk/src/lib.rs)：重导出契约与 automation，提供编译时 Registry、每次创建独立适配器实例及宿主日志能力 Host；RegisteredAdapter 实现同一个 Adapter 契约，不引入动态库 ABI。
-- [宿主适配器选择](src/bin/actweave.rs)：CLI 使用 `--adapter <name>`（默认 demo），在模型初始化之前通过 Registry 创建唯一实例并传给 TaskRuntime；仅注入该实例的 Skills。GUI 可通过 Registry::names 展示选项，再通过 Registry::create 创建所选适配器；注册工厂不会实例化其他适配器。
-- [开发 Runtime](crates/adapter-runtime/src/lib.rs)：独立加载已注册适配器、观察状态、获取 Skill、校验可用性、显式调用和输出步骤/参数/结果；执行控制由调用者提供，无 Core、模型或自动决策，不等同于用户任务 Runtime。
-- [Adapter 独立调试入口](crates/demo-adapter/examples/debug.rs)：`cargo run -p demo-adapter --example debug`；只依赖 SDK 与开发 Runtime，使用与主程序相同的 Demo 注册入口运行三次试验。
-- [Core](src/core.rs)：Task、Agent、`Execute { actions, then }`、`Resume`；动作列表校验、决策预算、加载与修复调度；策略不传入 Adapter。
-- [有序执行](src/execution.rs)：顺序执行 Call/Repeat/UntilDone、刷新上下文、保存已完成位置、分阶段失败记录与原位恢复；观察失败不撤销已确认动作，ReplaceRemaining 承接原进度和预算；不解释业务状态。
-- [任务 Runtime](src/task_runtime.rs)：任务 ID、生命周期、状态快照与订阅、暂停/继续/取消、任务事件日志；管理进程内执行上下文。
-- [任务统计](src/metrics.rs)：实际模型请求及 Adapter 调用计数、结果分布、执行中断与总耗时；任务独立，取消和丢弃调用也结算，摘要写入 Outcome 和最终 Runtime 快照。
-- [重复失败保护](src/failure_guard.rs)：任务内按工具及 JSON 参数记录实际失败，只有同一调用正常返回才清零；相同 Execute/ReplaceRemaining 计划反复被拒绝时停止；默认阈值 3，可通过 `--max-repeated-failures` 调整，不依赖业务进度字段。
-- [重复执行](src/batch.rs)：固定次数与 UntilDone 共用本地循环；Adapter 决定终止，Core 管理进度、预算、超时、异常恢复；保留已确认的完成事实。
-- [Skill 加载](src/skills.rs)：轻量目录、SkillView、按名称或 tags 加载、任务内加载范围；已选择但暂不可用的定义可用于规划后续动作，执行时仍由 Adapter 判断可用性。
-- [JEV 决策器](src/jev.rs)：TypeSafe Choice 协议、候选映射、每轮注入最新 Adapter guidance 与失败反馈；单次请求选择动作及后续策略，槽位复用候选 ID，不累计提示词历史。
-- [手动决策器](src/manual.rs)：从 stdin 读取 JSON 决策，用于 CLI 调试。
-- [决策诊断](src/diagnostics.rs)：模型/手动输入输出 JSONL、provider、任务/会话/请求关联标识；不接收鉴权头。
-- [Demo Adapter](crates/demo-adapter/src/lib.rs)：工具注册、参数校验、基于所给状态和反馈生成可用性及阶段指导、实际动作；不知道 Core 的存在。
-- [Demo Flow 接入](crates/demo-adapter/src/trial_flow.rs)：Rust 函数 definition 直接构建 Flow，无 JSON 配置文件；perform_trial 模拟 RGB 就绪画面、点击试验装置、再次识别完成画面。一次 Skill 对应一次有限流程，Core 按 Skill 计数；Runtime 故障交还 Core 修复，正常未获收益仍算完成。Runner 在一次 execute 内存在，适用于确认动作前故障的试验场景；长流程跨调用恢复应由 Adapter 持有 Runner。
-- [Demo 程序 Runtime](crates/demo-adapter/src/runtime.rs)：模式、训练、试验装置、未知数量探索与模拟故障；探索进度和完成条件由程序所有，与 Core 的任务 Runtime 分离。
-- [CLI](src/bin/actweave.rs)：参数与环境变量、模块组装、中文 INFO、任务日志目录、Ctrl+C 取消；`--max-actions` 默认 4，上限 16，设为 1 时不请求序列槽位；无 Web 服务。
+- [Adapter 契约](crates/adapter-api/src/lib.rs)
+- [用户功能与参数](crates/adapter-api/src/feature.rs)
+- [Adapter SDK 与注册](crates/adapter-sdk/src/lib.rs)
+- [Adapter 开发 Runtime](crates/adapter-runtime/src/lib.rs)
+- [Demo Adapter](crates/demo-adapter/src/lib.rs)
+- [Demo 程序状态](crates/demo-adapter/src/runtime.rs)
+- [Demo Flow](crates/demo-adapter/src/trial_flow.rs)
 
-## 测试
+## 自动化
 
-- [本地图像后端](crates/automation-vision/tests/vision.rs)：合成图验证模板位置、遮罩、多个结果与错误；OCR 模块单测验证文字过滤、坐标转换、取消响应和超时后无推理堆积。`ACTWEAVE_OCR_MODELS=/path/to/models cargo test -p automation-vision --test vision -- --ignored` 使用 PP-OCRv5_mobile_det.mnn、PP-OCRv5_mobile_rec.mnn、ppocr_keys_v5.txt 验证真实引擎；尚未验证原神截图。
-- [本地功能任务](tests/features.rs)：无模型执行、失败停止、暂停/继续/取消，以及 CLI 参数校验。
+- [自动化公共类型](crates/automation/src/lib.rs)
+- [Flow 编排](crates/automation/src/flow.rs)
+- [识别接口与注册](crates/automation/src/recognition.rs)
+- [动作与平台接口](crates/automation/src/action.rs)
+- [OCR 实现](crates/automation-vision/src/ocr.rs)
+- [模板匹配实现](crates/automation-vision/src/template.rs)
 
-- [动态识别区域](crates/automation/src/recognition.rs)：Roi::Fixed 使用客户区像素，Roi::Relative 按每次识别的当前帧尺寸解析，边界向外取整并校验；None 表示全帧。颜色、DirectHit、算法及自定义识别共用此入口，OCR 注册接口继续接收解析后的像素 ROI，无额外模型依赖。
+## 示例与测试
 
-- [自动化闭环](crates/automation/tests/flow.rs)：真实颜色检测配合 mock 输入验证优先分支、结构化目标、自定义扩展、异常恢复、超时预算、取消清理、暂停进度和配置校验。
-
-- [重复失败保护](tests/failure_guard.rs)：重复失败终止、恢复与替换保留计数、正常返回清零、计划拒绝及任务隔离。
-
-- [执行闭环](tests/loop.rs)：观察、决策、动作反馈、失败终止和决策预算。
-- [决策器切换](tests/agent_selection.rs)：手动决策、无候选工具、输入错误与 CLI 入口。
-- [按需加载](tests/discovery.rs)：名称/tags 选择、加载范围替换、可用性撤销和跨任务隔离。
-- [上下文契约](tests/skill_context.rs)：Core 传递上下文、Adapter 判断可用性和前置条件校验。
-- [动态决策上下文](tests/decision_context.rs)：阶段指导替换、最近失败与原中断区分、修复反馈、观察失败不重做动作、准确定位无效动作。
-- [重复任务](tests/batch.rs)：一次决策执行批次、准备动作不计入批次、异常续接、取消和预算限制。
-- [后续策略](tests/continuation.rs)：动作完成后结束或继续决策、失败/中断不误结束、批次恢复保留策略、拒绝旧格式。
-- [有序动作](tests/sequence.rs)：一次决策执行多个 Skill、前置条件变化、失败后不重放已完成动作、按需加载边界、暂停/取消、观察失败后的进度保留。
-- [未知次数循环](tests/until_done.rs)：一次决策循环至 Adapter 确认完成；序列衔接、异常续接、剩余计划替换、预算、可用性、加载边界、暂停/取消和观察失败。
-- [任务管理](tests/task_runtime.rs)：状态查询、暂停/继续/取消、执行被丢弃、日志失败和任务日志隔离。
-- [统计口径](tests/metrics.rs)：循环和修复计数、拒绝动作排除、正常未获收益、失败/取消摘要、模型请求与决策轮数区分及跨任务隔离。
-- [异步延迟 mock](tests/delay.rs)：仅用于测试的 delay Skill；单线程验证动作执行期间可查询和取消、暂停边界及超时。
-- [模型日志与协议](tests/model_logging.rs)：本地 HTTP mock，验证实际请求、响应、工具映射和异常日志。
-- [Demo 训练](tests/training.rs)：模式前置条件、训练完成、暂时故障恢复和永久不可用。
-
-## 使用入口
-
-- [README](README.md)：项目介绍、运行命令、日志选项和开发检查命令。
-- [Adapter 独立依赖](crates/demo-adapter/Cargo.toml)：验证 Demo 不反向依赖 Core。
+- [Adapter 调试示例](crates/demo-adapter/examples/debug.rs)
+- [Flow 示例](crates/automation/examples/dialogue.rs)
+- [OCR 示例](crates/automation-vision/examples/recognize.rs)
+- [任务与决策测试](tests/)
+- [用户功能契约测试](crates/adapter-api/tests/)
+- [Adapter 注册测试](crates/demo-adapter/tests/)
+- [Flow 测试](crates/automation/tests/)
+- [图像识别测试](crates/automation-vision/tests/)
