@@ -48,6 +48,7 @@
 - [Adapter 调试示例](crates/demo-adapter/examples/debug.rs)
 - [Flow 示例](crates/automation/examples/dialogue.rs)
 - [目标接近示例](crates/automation/examples/approach.rs)
+- [Adapter 控制器接入示例](crates/demo-adapter/examples/approach_adapter.rs)
 - [OCR 示例](crates/automation-vision/examples/recognize.rs)
 - [任务与决策测试](tests/)
 - [用户功能契约测试](crates/adapter-api/tests/)
