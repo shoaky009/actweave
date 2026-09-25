@@ -75,6 +75,11 @@ pub enum Action {
 #[derive(Debug, Clone)]
 pub enum Input {
     Click(Point),
+    /// Relative mouse movement, suitable for camera rotation on a captured window.
+    RelativeMove {
+        dx: i32,
+        dy: i32,
+    },
     LongPress {
         point: Point,
         duration_ms: u64,
@@ -101,7 +106,16 @@ pub trait Backend {
     fn release_all(&mut self) -> impl Future<Output = Result<(), Error>>;
 }
 
-pub type ActionFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, Error>> + 'a>>;
+/// A custom action runs one bounded operation and tells Flow what to do next.
+pub enum ActionResult {
+    Continue(Value),
+    Reobserve(Value),
+    Route { node: String, output: Value },
+    Complete(Value),
+    Blocked(String),
+}
+
+pub type ActionFuture<'a> = Pin<Box<dyn Future<Output = Result<ActionResult, Error>> + 'a>>;
 pub trait CustomAction<B> {
     fn execute<'a>(
         &'a mut self,
@@ -110,6 +124,8 @@ pub trait CustomAction<B> {
         recognition: &'a RecognitionResult,
         control: &'a Control,
     ) -> ActionFuture<'a>;
+
+    fn interrupted(&mut self) {}
 }
 
 pub struct Actions<B> {
@@ -140,13 +156,20 @@ impl<B: Backend> Actions<B> {
             _ => true,
         }
     }
+    pub fn interrupted(&mut self, action: &Action) {
+        if let Action::Custom { name, .. } = action
+            && let Some(handler) = self.custom.get_mut(name)
+        {
+            handler.interrupted();
+        }
+    }
     pub async fn execute(
         &mut self,
         action: &Action,
         backend: &mut B,
         recognition: &RecognitionResult,
         control: &Control,
-    ) -> Result<Value, Error> {
+    ) -> Result<ActionResult, Error> {
         control.check()?;
         let input = match action {
             Action::Click { target } => Input::Click(target.resolve(recognition)?),
@@ -170,7 +193,7 @@ impl<B: Backend> Actions<B> {
             Action::KeyUp { key } => Input::KeyUp(key.clone()),
             Action::Wait { duration_ms } => {
                 tokio::time::sleep(std::time::Duration::from_millis(*duration_ms)).await;
-                return Ok(Value::Null);
+                return Ok(ActionResult::Continue(Value::Null));
             }
             Action::Custom { name, parameters } => {
                 let handler = self
@@ -183,6 +206,6 @@ impl<B: Backend> Actions<B> {
             }
         };
         backend.input(&input, control).await?;
-        Ok(Value::Null)
+        Ok(ActionResult::Continue(Value::Null))
     }
 }

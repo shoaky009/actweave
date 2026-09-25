@@ -64,6 +64,7 @@ impl ActiveBatch {
         cancellation: CancellationToken,
         runtime: crate::task_runtime::TaskHandle,
     ) -> Self {
+        let pause = runtime.pause_token();
         Self {
             runtime,
             progress: BatchProgress {
@@ -83,6 +84,7 @@ impl ActiveBatch {
             control: ExecutionControl {
                 cancellation,
                 deadline: Instant::now().checked_add(timeout),
+                pause: Some(pause),
             },
             max_attempts,
         }
@@ -283,6 +285,7 @@ impl ActiveBatch {
                     stop_status = match error {
                         AdapterError::Cancelled => BatchStatus::Cancelled,
                         AdapterError::TimedOut => BatchStatus::TimedOut,
+                        AdapterError::CleanupFailed(_) => BatchStatus::Failed,
                         _ => BatchStatus::Interrupted,
                     };
                     ToolResult {
@@ -311,6 +314,10 @@ impl ActiveBatch {
                     return;
                 }
                 self.stop(BatchStatus::Failed, reason, emit);
+                return;
+            }
+            if failed && stop_status == BatchStatus::Failed {
+                self.stop(stop_status, message, emit);
                 return;
             }
             // Count a confirmed action even if the following observation fails.

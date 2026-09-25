@@ -33,6 +33,7 @@ fn node(actions: Vec<Action>, next: &[&str]) -> Node {
         actions,
         next: next.iter().map(|s| s.to_string()).collect(),
         on_error: vec![],
+        on_interrupted: vec![],
         timeout_ms: 100,
     }
 }
@@ -252,10 +253,87 @@ impl CustomAction<Mock> for Inspect {
         recognition: &'a RecognitionResult,
         _: &'a Control,
     ) -> ActionFuture<'a> {
-        Box::pin(
-            async move { Ok(json!({"text":recognition.matches[0].text,"parameters":parameters})) },
-        )
+        Box::pin(async move {
+            Ok(ActionResult::Continue(
+                json!({"text":recognition.matches[0].text,"parameters":parameters}),
+            ))
+        })
     }
+}
+
+struct Jump;
+impl CustomAction<Mock> for Jump {
+    fn execute<'a>(
+        &'a mut self,
+        _: &'a mut Mock,
+        _: &'a Value,
+        _: &'a RecognitionResult,
+        _: &'a Control,
+    ) -> ActionFuture<'a> {
+        Box::pin(async {
+            Ok(ActionResult::Route {
+                node: "target".into(),
+                output: Value::Null,
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn custom_step_routes_only_to_a_declared_next_node() {
+    let mut recognizers = Recognizers::default();
+    let mut actions = Actions::default();
+    actions.register("jump".into(), Jump).unwrap();
+    let entry = node(
+        vec![Action::Custom {
+            name: "jump".into(),
+            parameters: Value::Null,
+        }],
+        &["target"],
+    );
+    let mut runner = Runner::new(
+        flow(vec![("entry", entry), ("target", node(vec![click()], &[]))]),
+        &recognizers,
+        &actions,
+    )
+    .unwrap();
+    let mut backend = Mock::default();
+    finish(
+        &mut runner,
+        &mut backend,
+        &mut recognizers,
+        &mut actions,
+        &Control::default(),
+    )
+    .await;
+    assert_eq!(runner.progress().status, Status::Completed);
+    assert_eq!(runner.progress().node, "target");
+    assert_eq!(backend.inputs.len(), 1);
+
+    let entry = node(
+        vec![Action::Custom {
+            name: "jump".into(),
+            parameters: Value::Null,
+        }],
+        &[],
+    );
+    let mut runner = Runner::new(
+        flow(vec![("entry", entry), ("target", node(vec![click()], &[]))]),
+        &recognizers,
+        &actions,
+    )
+    .unwrap();
+    let mut backend = Mock::default();
+    finish(
+        &mut runner,
+        &mut backend,
+        &mut recognizers,
+        &mut actions,
+        &Control::default(),
+    )
+    .await;
+    assert_eq!(runner.progress().status, Status::Failed);
+    assert!(backend.inputs.is_empty());
 }
 #[tokio::test]
 async fn custom_recognition_and_action_share_structured_results() {
@@ -382,8 +460,13 @@ async fn pause_preserves_position_and_excludes_paused_time() {
     let mut actions = Actions::default();
     let mut mock = Mock::default();
     let ctrl = Control::default();
+    let mut entry = node(vec![click(), click()], &[]);
+    entry.on_interrupted = vec!["remaining".into()];
     let mut runner = Runner::new(
-        flow(vec![("entry", node(vec![click(), click()], &[]))]),
+        flow(vec![
+            ("entry", entry),
+            ("remaining", node(vec![click()], &[])),
+        ]),
         &rs,
         &actions,
     )
@@ -396,14 +479,15 @@ async fn pause_preserves_position_and_excludes_paused_time() {
         .step(&mut mock, &mut rs, &mut actions, &ctrl)
         .await
         .unwrap();
-    runner.pause();
-    tokio::time::advance(std::time::Duration::from_secs(10)).await;
-    runner
-        .step(&mut mock, &mut rs, &mut actions, &ctrl)
-        .await
-        .unwrap();
+    ctrl.pause();
+    let wait = async {
+        ctrl.paused().await;
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        ctrl.resume();
+    };
+    let (result, ()) = tokio::join!(runner.step(&mut mock, &mut rs, &mut actions, &ctrl), wait);
+    result.unwrap();
     assert_eq!(mock.inputs.len(), 1);
-    runner.resume();
     finish(&mut runner, &mut mock, &mut rs, &mut actions, &ctrl).await;
     assert_eq!(runner.progress().status, Status::Completed);
     assert_eq!(mock.inputs.len(), 2);

@@ -13,6 +13,7 @@ use std::{
     },
     time::Instant,
 };
+use tokio::sync::{Notify, watch};
 
 /// Errors from argument validation or concrete runtime operations.
 #[derive(Debug, thiserror::Error)]
@@ -25,17 +26,85 @@ pub enum AdapterError {
     TimedOut,
     #[error("runtime: {0}")]
     Runtime(String),
+    #[error("input cleanup failed: {0}")]
+    CleanupFailed(String),
 }
 
 /// Shared cooperative cancellation, usable from CLI, GUI or a supervising thread.
+#[derive(Debug, Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
 #[derive(Debug, Clone, Default)]
-pub struct CancellationToken(Arc<AtomicBool>);
+pub struct CancellationToken(Arc<CancellationState>);
 impl CancellationToken {
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.0.cancelled.store(true, Ordering::SeqCst);
+        self.0.notify.notify_waiters();
     }
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.0.cancelled.load(Ordering::SeqCst)
+    }
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// A pause request is acknowledged only after the current operation is quiescent.
+#[derive(Clone)]
+pub struct PauseToken {
+    requested: Arc<watch::Sender<bool>>,
+    on_paused: Arc<dyn Fn() + Send + Sync>,
+}
+impl Default for PauseToken {
+    fn default() -> Self {
+        Self::new(|| {})
+    }
+}
+impl PauseToken {
+    pub fn new(on_paused: impl Fn() + Send + Sync + 'static) -> Self {
+        let (requested, _) = watch::channel(false);
+        Self {
+            requested: Arc::new(requested),
+            on_paused: Arc::new(on_paused),
+        }
+    }
+    pub fn request(&self) {
+        self.requested.send_replace(true);
+    }
+    pub fn resume(&self) {
+        self.requested.send_replace(false);
+    }
+    pub fn is_requested(&self) -> bool {
+        *self.requested.borrow()
+    }
+    pub fn acknowledge(&self) {
+        if self.is_requested() {
+            (self.on_paused)();
+        }
+    }
+    pub async fn requested(&self) {
+        self.wait_for(true).await;
+    }
+    pub async fn resumed(&self) {
+        self.wait_for(false).await;
+    }
+    async fn wait_for(&self, value: bool) {
+        let mut changes = self.requested.subscribe();
+        while *changes.borrow_and_update() != value {
+            if changes.changed().await.is_err() {
+                return;
+            }
+        }
     }
 }
 /// Execution cancellation and deadline; adapters check this between operations.
@@ -43,6 +112,7 @@ impl CancellationToken {
 pub struct ExecutionControl {
     pub cancellation: CancellationToken,
     pub deadline: Option<Instant>,
+    pub pause: Option<PauseToken>,
 }
 impl ExecutionControl {
     pub fn check(&self) -> Result<(), AdapterError> {
@@ -56,6 +126,28 @@ impl ExecutionControl {
             return Err(AdapterError::TimedOut);
         }
         Ok(())
+    }
+    /// Call after releasing any held inputs; this acknowledges a pending pause.
+    pub async fn wait_if_paused(&self) -> Result<(), AdapterError> {
+        self.check()?;
+        if let Some(pause) = &self.pause
+            && pause.is_requested()
+        {
+            pause.acknowledge();
+            if let Some(deadline) = self.deadline {
+                tokio::select! {
+                    _ = pause.resumed() => {},
+                    _ = self.cancellation.cancelled() => {},
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {},
+                }
+            } else {
+                tokio::select! {
+                    _ = pause.resumed() => {},
+                    _ = self.cancellation.cancelled() => {},
+                }
+            }
+        }
+        self.check()
     }
 }
 /// Completing an action and obtaining the desired application effect are different facts.

@@ -3,6 +3,7 @@ use crate::core::{
     Adapter, Agent, CancellationToken, Error, Event, Outcome, RunOptions, Status, Task,
 };
 use crate::metrics::{MeasuredAdapter, TaskMetrics, TaskSummary};
+use adapter_api::PauseToken;
 use serde::Serialize;
 use std::{
     io::Write,
@@ -56,6 +57,7 @@ struct Journal {
 pub struct TaskHandle {
     state: Arc<watch::Sender<TaskSnapshot>>,
     cancellation: CancellationToken,
+    pause: PauseToken,
     journal: Arc<Mutex<Journal>>,
     metrics: TaskMetrics,
 }
@@ -68,16 +70,31 @@ impl TaskHandle {
         self.state.subscribe()
     }
     pub fn pause(&self) -> bool {
-        self.transition(
-            &[TaskStatus::Created, TaskStatus::Running],
-            TaskStatus::PauseRequested,
-        )
+        let mut accepted = false;
+        self.state.send_modify(|snapshot| {
+            if matches!(snapshot.status, TaskStatus::Created | TaskStatus::Running) {
+                snapshot.status = TaskStatus::PauseRequested;
+                self.pause.request();
+                self.record(&snapshot.task_id, "lifecycle", snapshot);
+                accepted = true;
+            }
+        });
+        accepted
     }
     pub fn resume(&self) -> bool {
-        self.transition(
-            &[TaskStatus::PauseRequested, TaskStatus::Paused],
-            TaskStatus::Running,
-        )
+        let mut accepted = false;
+        self.state.send_modify(|snapshot| {
+            if matches!(
+                snapshot.status,
+                TaskStatus::PauseRequested | TaskStatus::Paused
+            ) {
+                snapshot.status = TaskStatus::Running;
+                self.pause.resume();
+                self.record(&snapshot.task_id, "lifecycle", snapshot);
+                accepted = true;
+            }
+        });
+        accepted
     }
     pub fn cancel(&self) -> bool {
         let mut accepted = false;
@@ -85,11 +102,15 @@ impl TaskHandle {
             if !s.status.terminal() && s.status != TaskStatus::CancelRequested {
                 self.cancellation.cancel();
                 s.status = TaskStatus::CancelRequested;
+                self.pause.resume();
                 self.record(&s.task_id, "lifecycle", &s);
                 accepted = true;
             }
         });
         accepted
+    }
+    pub(crate) fn pause_token(&self) -> PauseToken {
+        self.pause.clone()
     }
     fn transition(&self, from: &[TaskStatus], to: TaskStatus) -> bool {
         let mut accepted = false;
@@ -103,18 +124,7 @@ impl TaskHandle {
         accepted
     }
     fn record(&self, task_id: &str, kind: &str, data: &impl Serialize) {
-        let mut journal = self.journal.lock().unwrap_or_else(|e| e.into_inner());
-        if journal.error.is_some() {
-            return;
-        }
-        let entry = serde_json::json!({"task_id": task_id, "timestamp_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(), "kind":kind,"data":data});
-        let result = serde_json::to_writer(&mut journal.writer, &entry)
-            .map_err(std::io::Error::other)
-            .and_then(|()| journal.writer.write_all(b"\n"))
-            .and_then(|()| journal.writer.flush());
-        if let Err(error) = result {
-            journal.error = Some(error.to_string());
-        }
+        record(&self.journal, task_id, kind, data);
     }
     pub(crate) fn check_log(&self) -> Result<(), Error> {
         let journal = self.journal.lock().unwrap_or_else(|e| e.into_inner());
@@ -154,11 +164,10 @@ impl TaskHandle {
             if self.cancellation.is_cancelled() || deadline.is_some_and(|d| Instant::now() >= d) {
                 return Ok(());
             }
-            self.transition(&[TaskStatus::PauseRequested], TaskStatus::Paused);
+            self.pause.acknowledge();
             if self.snapshot().status != TaskStatus::Paused {
                 return Ok(());
             }
-            // Also observe cancellation through the legacy RunOptions token.
             tokio::select! {
                 _ = updates.changed() => {},
                 _ = tokio::time::sleep(Duration::from_millis(25)) => {},
@@ -197,6 +206,21 @@ impl TaskHandle {
     }
 }
 
+fn record(journal: &Arc<Mutex<Journal>>, task_id: &str, kind: &str, data: &impl Serialize) {
+    let mut journal = journal.lock().unwrap_or_else(|e| e.into_inner());
+    if journal.error.is_some() {
+        return;
+    }
+    let entry = serde_json::json!({"task_id": task_id, "timestamp_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(), "kind":kind,"data":data});
+    let result = serde_json::to_writer(&mut journal.writer, &entry)
+        .map_err(std::io::Error::other)
+        .and_then(|()| journal.writer.write_all(b"\n"))
+        .and_then(|()| journal.writer.flush());
+    if let Err(error) = result {
+        journal.error = Some(error.to_string());
+    }
+}
+
 /// One task execution. Consuming `run` prevents accidental duplicate starts.
 /// The caller owns scheduling; a mutable adapter borrow prevents concurrent use of one adapter.
 pub struct TaskRuntime {
@@ -223,14 +247,29 @@ impl TaskRuntime {
             current_skill: None,
             reason: None,
         });
+        let state = Arc::new(state);
+        let journal = Arc::new(Mutex::new(Journal {
+            writer: Box::new(std::io::sink()),
+            error: None,
+        }));
+        let weak_state = Arc::downgrade(&state);
+        let weak_journal = Arc::downgrade(&journal);
+        let pause = PauseToken::new(move || {
+            if let (Some(state), Some(journal)) = (weak_state.upgrade(), weak_journal.upgrade()) {
+                state.send_modify(|snapshot| {
+                    if snapshot.status == TaskStatus::PauseRequested {
+                        snapshot.status = TaskStatus::Paused;
+                        record(&journal, &snapshot.task_id, "lifecycle", snapshot);
+                    }
+                });
+            }
+        });
         let handle = TaskHandle {
-            state: Arc::new(state),
+            state,
             cancellation: options.cancellation.clone(),
+            pause,
             metrics: TaskMetrics::default(),
-            journal: Arc::new(Mutex::new(Journal {
-                writer: Box::new(std::io::sink()),
-                error: None,
-            })),
+            journal,
         };
         Self {
             task,

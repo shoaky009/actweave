@@ -336,6 +336,7 @@ impl ActiveExecution {
                     let control = ExecutionControl {
                         cancellation: ctx.options.cancellation.clone(),
                         deadline: None,
+                        pause: Some(ctx.runtime.pause_token()),
                     };
                     let report = ctx.environment.execute(&call, &control).await;
                     let stop_reason =
@@ -355,6 +356,7 @@ impl ActiveExecution {
                             let status = match error {
                                 AdapterError::Cancelled => ExecutionStatus::Cancelled,
                                 AdapterError::TimedOut => ExecutionStatus::Failed,
+                                AdapterError::CleanupFailed(_) => ExecutionStatus::Failed,
                                 _ => ExecutionStatus::Interrupted,
                             };
                             (
@@ -395,6 +397,11 @@ impl ActiveExecution {
                         } else {
                             self.stop(ExecutionStatus::Failed, reason, &mut ctx.emit);
                         }
+                        return Ok(());
+                    }
+                    if !success && status == ExecutionStatus::Failed {
+                        self.progress.failure = ctx.failure.clone();
+                        self.stop(status, message, &mut ctx.emit);
                         return Ok(());
                     }
                     if let Err(error) = ctx.observe_after(Some(&completed_call)) {

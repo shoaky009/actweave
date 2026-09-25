@@ -1,6 +1,7 @@
 //! Compile-time plugin boundary. No Core dependency and no dynamic-library ABI.
 pub use adapter_api::*;
 pub use automation;
+pub mod flow_runtime;
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
 
 /// Host-owned diagnostics supplied when creating a plugin instance.

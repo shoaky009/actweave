@@ -1,13 +1,15 @@
 //! Priority-based visual branching, with bounded polling and explicit error routes.
 use crate::{
     Control, Error,
-    action::{Action, Actions, Backend},
+    action::{Action, ActionResult, Actions, Backend},
     recognition::{Recognition, RecognitionResult, Recognizers},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, time::Duration};
 use tokio::time::Instant;
+
+const INPUT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -19,6 +21,9 @@ pub struct Node {
     pub next: Vec<String>,
     #[serde(default)]
     pub on_error: Vec<String>,
+    /// Candidates to re-observe after an input may have been interrupted.
+    #[serde(default)]
+    pub on_interrupted: Vec<String>,
     /// Bound each phase: this node's actions, then polling its next candidates.
     pub timeout_ms: u64,
 }
@@ -49,7 +54,12 @@ impl Flow {
                 return Err(Error::Invalid(format!("invalid node or timeout: {name}")));
             }
             node.recognition.validate()?;
-            for target in node.next.iter().chain(&node.on_error) {
+            for target in node
+                .next
+                .iter()
+                .chain(&node.on_error)
+                .chain(&node.on_interrupted)
+            {
                 if !self.nodes.contains_key(target) {
                     return Err(Error::Invalid(format!("unknown target {target} in {name}")));
                 }
@@ -84,6 +94,7 @@ impl Flow {
 pub enum Status {
     Running,
     Completed,
+    Blocked,
     Failed,
     Cancelled,
 }
@@ -158,24 +169,71 @@ impl Runner {
     pub fn progress(&self) -> &Progress {
         &self.progress
     }
-    /// Pause at a step boundary; call after an in-flight step returns. For held keys,
-    /// release via the backend before allowing an extended pause.
-    pub fn pause(&mut self) {
-        if self.paused_at.is_none() {
-            self.paused_at = Some(Instant::now());
+    fn notify_interrupted<B: Backend>(&self, actions: &mut Actions<B>) {
+        if let Some(index) = self.progress.action_index
+            && let Some(action) = self.pipeline.nodes[&self.progress.node].actions.get(index)
+        {
+            actions.interrupted(action);
         }
     }
-    pub fn resume(&mut self) {
-        if let Some(at) = self.paused_at.take() {
-            let elapsed = at.elapsed();
-            self.deadline += elapsed;
-            self.next_poll += elapsed;
+    async fn release_input<B: Backend>(&mut self, backend: &mut B) -> Result<(), Error> {
+        let result = match tokio::time::timeout(INPUT_CLEANUP_TIMEOUT, backend.release_all()).await
+        {
+            Ok(result) => result,
+            Err(_) => Err(Error::Backend("input cleanup timed out".into())),
+        };
+        if let Err(error) = result {
+            self.progress.status = Status::Failed;
+            self.progress.message = format!("input cleanup failed: {error}");
+            return Err(Error::Cleanup(error.to_string()));
         }
+        Ok(())
     }
     pub async fn cancel<B: Backend>(&mut self, backend: &mut B) -> Result<(), Error> {
+        self.release_input(backend).await?;
         self.progress.status = Status::Cancelled;
         self.progress.message = "cancelled".into();
-        backend.release_all().await
+        Ok(())
+    }
+    async fn park<B: Backend>(
+        &mut self,
+        backend: &mut B,
+        actions: &mut Actions<B>,
+        control: &Control,
+        interrupted_action: bool,
+    ) -> Result<(), Error> {
+        self.release_input(backend).await?;
+        if self.progress.action_index.is_some() {
+            self.notify_interrupted(actions);
+            let recovery = &self.pipeline.nodes[&self.progress.node].on_interrupted;
+            if recovery.is_empty() && (interrupted_action || self.progress.action_index != Some(0))
+            {
+                self.progress.status = Status::Blocked;
+                self.progress.message = "action outcome unknown after pause".into();
+            } else {
+                self.candidates = if recovery.is_empty() {
+                    vec![self.progress.node.clone()]
+                } else {
+                    recovery.clone()
+                };
+                self.progress.action_index = None;
+                self.progress.recognition = RecognitionResult::default();
+                self.progress.action_result = Value::Null;
+                self.progress.message = "re-observe after pause".into();
+            }
+        }
+        let paused_at = Instant::now();
+        self.paused_at = Some(paused_at);
+        control.acknowledge_pause();
+        tokio::select! {
+            biased;
+            _ = control.cancelled() => self.cancel(backend).await?,
+            _ = control.resumed() => {},
+        }
+        let elapsed = self.paused_at.take().unwrap_or(paused_at).elapsed();
+        self.deadline += elapsed;
+        self.next_poll += elapsed;
+        Ok(())
     }
     pub async fn step<B: Backend>(
         &mut self,
@@ -191,24 +249,33 @@ impl Runner {
             self.cancel(backend).await?;
             return Ok(&self.progress);
         }
-        if self.paused_at.is_some() {
+        if control.is_pause_requested() {
+            self.park(backend, actions, control, false).await?;
             return Ok(&self.progress);
         }
         if self.progress.operations >= self.pipeline.max_operations {
             self.progress.status = Status::Failed;
             self.progress.message = "flow operation budget exhausted".into();
-            backend.release_all().await?;
+            self.release_input(backend).await?;
             return Ok(&self.progress);
         }
         self.progress.operations += 1;
         let deadline = self.deadline;
         let result = tokio::select! {
             biased;
-            _ = control.cancelled() => Err(Error::Cancelled),
-            _ = tokio::time::sleep_until(deadline) => Err(Error::TimedOut),
-            result = self.advance(backend, recognizers, actions, control) => result,
+            _ = control.cancelled() => Some(Err(Error::Cancelled)),
+            _ = control.pause_requested() => None,
+            _ = tokio::time::sleep_until(deadline) => Some(Err(Error::TimedOut)),
+            result = self.advance(backend, recognizers, actions, control) => Some(result),
+        };
+        let Some(result) = result else {
+            let interrupted_action = self.progress.action_index.is_some();
+            self.park(backend, actions, control, interrupted_action)
+                .await?;
+            return Ok(&self.progress);
         };
         if let Err(error) = result {
+            self.notify_interrupted(actions);
             let cancelled = matches!(error, Error::Cancelled);
             self.progress.failure = Some(Failure {
                 node: self.progress.node.clone(),
@@ -217,9 +284,8 @@ impl Runner {
             });
             self.progress.message = error.to_string();
             // Release any partial input before entering a recovery flow.
-            if let Err(cleanup) = backend.release_all().await {
-                self.progress.status = Status::Failed;
-                self.progress.message = format!("{error}; input cleanup failed: {cleanup}");
+            if let Err(cleanup) = self.release_input(backend).await {
+                self.progress.message = format!("{error}; {}", self.progress.message);
                 return Err(cleanup);
             }
             let recovery = &self.pipeline.nodes[&self.progress.node].on_error;
@@ -238,12 +304,8 @@ impl Runner {
                     Instant::now() + Duration::from_millis(self.pipeline.poll_interval_ms);
             }
         }
-        if self.progress.status == Status::Completed
-            && let Err(error) = backend.release_all().await
-        {
-            self.progress.status = Status::Failed;
-            self.progress.message = format!("input cleanup failed: {error}");
-            return Err(error);
+        if matches!(self.progress.status, Status::Completed | Status::Blocked) {
+            self.release_input(backend).await?;
         }
         Ok(&self.progress)
     }
@@ -257,11 +319,60 @@ impl Runner {
         if let Some(index) = self.progress.action_index {
             let node = &self.pipeline.nodes[&self.progress.node];
             if let Some(action) = node.actions.get(index) {
-                self.progress.action_result = actions
+                let result = actions
                     .execute(action, backend, &self.progress.recognition, control)
                     .await?;
-                self.progress.action_index = Some(index + 1);
-                self.progress.message = "action completed".into();
+                match result {
+                    ActionResult::Continue(output) => {
+                        self.progress.action_result = output;
+                        self.progress.action_index = Some(index + 1);
+                        self.progress.message = "action completed".into();
+                    }
+                    ActionResult::Reobserve(output) => {
+                        if index != 0 || node.actions.len() != 1 {
+                            return Err(Error::Invalid(
+                                "reobserve requires a single-action node".into(),
+                            ));
+                        }
+                        self.progress.action_result = output;
+                        self.progress.action_index = None;
+                        self.candidates = vec![self.progress.node.clone()];
+                        self.deadline = Instant::now() + Duration::from_millis(node.timeout_ms);
+                        self.next_poll = Instant::now();
+                        self.progress.message = "re-observe".into();
+                        return Ok(());
+                    }
+                    ActionResult::Route {
+                        node: target,
+                        output,
+                    } => {
+                        if !node.next.contains(&target) {
+                            return Err(Error::Invalid(format!(
+                                "action routed outside next candidates: {target}"
+                            )));
+                        }
+                        self.progress.action_result = output;
+                        self.progress.action_index = None;
+                        self.candidates = vec![target];
+                        self.deadline = Instant::now() + Duration::from_millis(node.timeout_ms);
+                        self.next_poll = Instant::now();
+                        self.progress.message = "action routed".into();
+                        return Ok(());
+                    }
+                    ActionResult::Complete(output) => {
+                        self.progress.action_result = output;
+                        self.progress.action_index = None;
+                        self.progress.status = Status::Completed;
+                        self.progress.message = "flow completed".into();
+                        return Ok(());
+                    }
+                    ActionResult::Blocked(reason) => {
+                        self.progress.action_index = None;
+                        self.progress.status = Status::Blocked;
+                        self.progress.message = reason;
+                        return Ok(());
+                    }
+                }
             }
             if self.progress.action_index == Some(node.actions.len()) {
                 self.progress.action_index = None;

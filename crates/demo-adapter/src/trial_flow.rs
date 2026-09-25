@@ -9,6 +9,7 @@ use adapter_sdk::automation::{
     flow::{Flow, Node, Runner, Status},
     recognition::{Frame, Recognition, Recognizers},
 };
+use adapter_sdk::flow_runtime;
 use adapter_sdk::{AdapterError, ExecutionControl};
 
 fn definition() -> Flow {
@@ -32,6 +33,7 @@ fn definition() -> Flow {
                     }],
                     next: vec!["confirmed".into()],
                     on_error: vec![],
+                    on_interrupted: vec!["confirmed".into(), "ready".into()],
                     timeout_ms: 1000,
                 },
             ),
@@ -42,6 +44,7 @@ fn definition() -> Flow {
                     actions: vec![],
                     next: vec![],
                     on_error: vec![],
+                    on_interrupted: vec![],
                     timeout_ms: 1000,
                 },
             ),
@@ -124,32 +127,26 @@ pub(super) async fn execute(
         result: None,
         error: None,
     };
-    let flow_control = Control::default();
-    loop {
-        if let Err(error) = control.check() {
-            runner.cancel(&mut device).await.map_err(flow_error)?;
-            return Err(error);
-        }
-        let progress = runner
-            .step(&mut device, &mut recognizers, &mut actions, &flow_control)
-            .await
-            .map_err(flow_error)?;
-        match progress.status {
-            Status::Running => {}
-            Status::Completed => {
-                return device.result.ok_or_else(|| {
-                    AdapterError::Runtime("flow completed without a confirmed trial".into())
-                });
+    let progress = flow_runtime::run(
+        &mut runner,
+        &mut device,
+        &mut recognizers,
+        &mut actions,
+        control,
+    )
+    .await?;
+    match progress.status {
+        Status::Completed => device.result.ok_or_else(|| {
+            AdapterError::Runtime("flow completed without a confirmed trial".into())
+        }),
+        Status::Cancelled => Err(AdapterError::Cancelled),
+        Status::Blocked | Status::Failed => {
+            if let Some(error) = device.error.take() {
+                return Err(runtime_error(error));
             }
-            Status::Cancelled => return Err(AdapterError::Cancelled),
-            Status::Failed => {
-                if let Some(error) = device.error.take() {
-                    return Err(runtime_error(error));
-                }
-                control.check()?;
-                return Err(AdapterError::Runtime(progress.message.clone()));
-            }
+            Err(AdapterError::Runtime(progress.message))
         }
+        Status::Running => Err(AdapterError::Runtime("flow returned while running".into())),
     }
 }
 

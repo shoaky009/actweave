@@ -8,7 +8,7 @@ use serde_json::json;
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::Duration,
 };
@@ -110,6 +110,126 @@ async fn wait_paused(handle: &TaskHandle) {
         }
         updates.changed().await.unwrap();
     }
+}
+
+struct HeldInputAdapter {
+    held: Arc<AtomicBool>,
+    started: Arc<Notify>,
+}
+impl Adapter for HeldInputAdapter {
+    fn observe(&self) -> Result<AppState, AdapterError> {
+        Ok(AppState {
+            scene: "held input mock".into(),
+            facts: json!({}),
+        })
+    }
+    fn decision_context(
+        &self,
+        context: &SkillContext<'_>,
+    ) -> Result<DecisionContext, AdapterError> {
+        adapter().decision_context(context)
+    }
+    async fn execute(
+        &mut self,
+        _: &ToolCall,
+        control: &ExecutionControl,
+    ) -> Result<ActionReport, AdapterError> {
+        control.check()?;
+        self.held.store(true, Ordering::SeqCst);
+        self.started.notify_one();
+        if let Some(pause) = &control.pause {
+            tokio::select! {
+                _ = control.cancellation.cancelled() => return Err(AdapterError::Cancelled),
+                _ = pause.requested() => {},
+            }
+        }
+        self.held.store(false, Ordering::SeqCst);
+        control.wait_if_paused().await?;
+        Ok(ActionReport::completed("input released".into(), true))
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn task_reports_paused_only_after_adapter_releases_input() {
+    let runtime = runtime(RunOptions::default());
+    let handle = runtime.handle();
+    let held = Arc::new(AtomicBool::new(false));
+    let started = Arc::new(Notify::new());
+    let mut adapter = HeldInputAdapter {
+        held: held.clone(),
+        started: started.clone(),
+    };
+    let mut agent = DecideOnce(Some(Decision::Execute {
+        actions: vec![Action::Call(call())],
+        then: Continuation::Finish,
+    }));
+    let work = runtime.run(&mut agent, &mut adapter, |_| {});
+    let steer = async {
+        started.notified().await;
+        assert!(held.load(Ordering::SeqCst));
+        assert!(handle.pause());
+        assert_eq!(handle.snapshot().status, TaskStatus::PauseRequested);
+        wait_paused(&handle).await;
+        assert!(!held.load(Ordering::SeqCst));
+        assert!(handle.resume());
+    };
+    let (result, ()) =
+        tokio::time::timeout(Duration::from_secs(2), async { tokio::join!(work, steer) })
+            .await
+            .unwrap();
+    assert_eq!(result.unwrap().status, Status::Completed);
+}
+
+struct CleanupFailureAdapter {
+    observations: Arc<AtomicU32>,
+    before_failure: Arc<AtomicU32>,
+}
+impl Adapter for CleanupFailureAdapter {
+    fn observe(&self) -> Result<AppState, AdapterError> {
+        self.observations.fetch_add(1, Ordering::SeqCst);
+        Ok(AppState {
+            scene: "cleanup mock".into(),
+            facts: json!({}),
+        })
+    }
+    fn decision_context(
+        &self,
+        context: &SkillContext<'_>,
+    ) -> Result<DecisionContext, AdapterError> {
+        adapter().decision_context(context)
+    }
+    async fn execute(
+        &mut self,
+        _: &ToolCall,
+        _: &ExecutionControl,
+    ) -> Result<ActionReport, AdapterError> {
+        self.before_failure
+            .store(self.observations.load(Ordering::SeqCst), Ordering::SeqCst);
+        Err(AdapterError::CleanupFailed("W may still be held".into()))
+    }
+}
+
+#[tokio::test]
+async fn cleanup_failure_fails_task_without_another_observation() {
+    let observations = Arc::new(AtomicU32::new(0));
+    let before_failure = Arc::new(AtomicU32::new(0));
+    let mut adapter = CleanupFailureAdapter {
+        observations: observations.clone(),
+        before_failure: before_failure.clone(),
+    };
+    let task = runtime(RunOptions::default());
+    let handle = task.handle();
+    let mut agent = DecideOnce(Some(Decision::Execute {
+        actions: vec![Action::Call(call())],
+        then: Continuation::Finish,
+    }));
+    let outcome = task.run(&mut agent, &mut adapter, |_| {}).await.unwrap();
+    assert_eq!(outcome.status, Status::Failed);
+    assert_eq!(handle.snapshot().status, TaskStatus::Failed);
+    assert_eq!(
+        observations.load(Ordering::SeqCst),
+        before_failure.load(Ordering::SeqCst)
+    );
 }
 
 async fn cancel_during(decision: Decision) {

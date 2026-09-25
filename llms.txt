@@ -27,6 +27,7 @@
 - [Adapter 契约](crates/adapter-api/src/lib.rs)
 - [用户功能与参数](crates/adapter-api/src/feature.rs)
 - [Adapter SDK 与注册](crates/adapter-sdk/src/lib.rs)
+- [Adapter Flow 执行桥接](crates/adapter-sdk/src/flow_runtime.rs)
 - [Adapter 开发 Runtime](crates/adapter-runtime/src/lib.rs)
 - [Demo Adapter](crates/demo-adapter/src/lib.rs)
 - [Demo 程序状态](crates/demo-adapter/src/runtime.rs)
@@ -38,6 +39,7 @@
 - [Flow 编排](crates/automation/src/flow.rs)
 - [识别接口与注册](crates/automation/src/recognition.rs)
 - [动作与平台接口](crates/automation/src/action.rs)
+- [目标接近控制](crates/automation/src/control.rs)
 - [OCR 实现](crates/automation-vision/src/ocr.rs)
 - [模板匹配实现](crates/automation-vision/src/template.rs)
 
@@ -45,6 +47,7 @@
 
 - [Adapter 调试示例](crates/demo-adapter/examples/debug.rs)
 - [Flow 示例](crates/automation/examples/dialogue.rs)
+- [目标接近示例](crates/automation/examples/approach.rs)
 - [OCR 示例](crates/automation-vision/examples/recognize.rs)
 - [任务与决策测试](tests/)
 - [用户功能契约测试](crates/adapter-api/tests/)
